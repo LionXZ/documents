@@ -25,6 +25,12 @@
 - [12. 备份与恢复](#12-备份与恢复)
 - [13. 性能优化](#13-性能优化)
 - [14. 常见问题排查](#14-常见问题排查)
+- [15. 系统数据库](#15-系统数据库)
+  - [15.1 mysql — 账号权限](#151-mysql--账号权限)
+  - [15.2 information_schema — 元数据](#152-information_schema--元数据)
+  - [15.3 performance_schema — 性能监控](#153-performance_schema--性能监控)
+  - [15.4 sys — 运维诊断](#154-sys--运维诊断)
+  - [15.5 四库关系图谱](#155-四库关系图谱)
 
 ---
 
@@ -1688,6 +1694,313 @@ CREATE DATABASE your_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 -- 修改现有字符集
 ALTER DATABASE your_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 ALTER TABLE your_table CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+---
+
+## 15. 系统数据库
+
+MySQL 除了用户创建的库，还自带四个系统数据库，各司其职：
+
+```
+mysql                →  谁能进来？（账号权限配置，持久化）
+information_schema   →  系统里有什么？（表结构/索引/列的元数据）
+performance_schema   →  发生了什么？（实时性能指标：锁/内存/IO）
+sys                  →  翻译成人话（把上面两个封装成易读视图）
+```
+
+### 15.1 mysql — 账号权限
+
+`mysql` 库是 MySQL 的**系统核心库**，存放用户、权限、存储过程等配置，**持久化**在磁盘。修改后直接影响 MySQL 行为。
+
+**核心表：**
+
+| 表名 | 内容 | 重要度 |
+|------|------|--------|
+| **user** | 用户账号 + 全局权限 | 最重要 |
+| **db** | 数据库级别的权限 | 常用 |
+| **tables_priv** | 表级别的权限 | 偶用 |
+| **columns_priv** | 列级别的权限 | 少用 |
+| **proc** | 存储过程定义 | 常用 |
+| **func** | 函数定义 | 常用 |
+
+**权限的层级关系（自上而下匹配）：**
+
+```
+mysql.user        → 全局权限（SUPER、FILE 等最高权限在这里）
+  ↓ 如果 user 表权限字段 = 'N'
+mysql.db          → 数据库级别权限（对某库有 SELECT/INSERT 等）
+  ↓ 如果 db 表权限字段 = 'N'
+mysql.tables_priv → 表级别权限（精确到某张表能做什么）
+  ↓ 仍然不够
+mysql.columns_priv → 列级别权限（精确到"某表.某列"只读）
+```
+
+**常用查询：**
+
+```sql
+-- 查看所有用户
+SELECT user, host, account_locked FROM mysql.user;
+
+-- 查看谁有 SUPER 权限（危险权限，可修改全局变量）
+SELECT user, host FROM mysql.user WHERE Super_priv = 'Y';
+
+-- 查看某用户对某库的具体权限
+SELECT * FROM mysql.db WHERE user = 'appuser' AND db = 'shop';
+
+-- 查看存储过程
+SELECT db, name, type FROM mysql.proc WHERE db = 'shop';
+```
+
+> **注意**：权限管理优先用 `GRANT` / `REVOKE` 语句，不要直接改 `mysql.*` 表（容易出错且不刷新）。
+
+---
+
+### 15.2 information_schema — 元数据
+
+`information_schema` 是 ANSI SQL 标准的**元数据视图库**，内容从 `.frm` 文件和内部数据字典实时提取，**只读、内存临时表**。
+
+**核心表：**
+
+| 表名 | 内容 |
+|------|------|
+| **SCHEMATA** | 所有数据库 |
+| **TABLES** | 所有表（含引擎、行数、数据/索引大小） |
+| **COLUMNS** | 所有列（含类型、可空、默认值、注释） |
+| **STATISTICS** | 所有索引（含唯一/非唯一、类型） |
+| **TABLE_CONSTRAINTS** | 主键、外键、唯一约束 |
+| **KEY_COLUMN_USAGE** | 约束涉及哪些列 |
+| **ENGINES** | 支持的存储引擎 |
+| **ROUTINES** | 存储过程、函数 |
+| **VIEWS** | 视图定义 |
+
+**最常用的查询：**
+
+```sql
+-- 1. 查表大小（运维必备）
+SELECT
+    TABLE_NAME                                      AS '表名',
+    TABLE_ROWS                                      AS '约行数',
+    ROUND(DATA_LENGTH / 1024 / 1024, 2)            AS '数据(MB)',
+    ROUND(INDEX_LENGTH / 1024 / 1024, 2)           AS '索引(MB)',
+    ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2) AS '总(MB)'
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'shop'
+ORDER BY (DATA_LENGTH + INDEX_LENGTH) DESC;
+
+-- 2. 查表的所有列（替代 DESC）
+SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_COMMENT
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = 'shop' AND TABLE_NAME = 'users'
+ORDER BY ORDINAL_POSITION;
+
+-- 3. 查表的所有索引（替代 SHOW INDEX）
+SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE, INDEX_TYPE
+FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = 'shop' AND TABLE_NAME = 'users';
+
+-- 4. 找出没有主键的表（危险！主键缺失 → 主从延迟、行锁问题）
+SELECT TABLE_NAME
+FROM information_schema.TABLES t
+WHERE TABLE_SCHEMA = 'shop'
+  AND TABLE_NAME NOT IN (
+      SELECT TABLE_NAME FROM information_schema.TABLE_CONSTRAINTS
+      WHERE TABLE_SCHEMA = 'shop' AND CONSTRAINT_TYPE = 'PRIMARY KEY'
+  );
+
+-- 5. 查外键关系
+SELECT
+    TABLE_NAME              AS '表',
+    COLUMN_NAME             AS '列',
+    REFERENCED_TABLE_NAME   AS '引用表',
+    REFERENCED_COLUMN_NAME  AS '引用列'
+FROM information_schema.KEY_COLUMN_USAGE
+WHERE TABLE_SCHEMA = 'shop' AND REFERENCED_TABLE_NAME IS NOT NULL;
+```
+
+---
+
+### 15.3 performance_schema — 性能监控
+
+`performance_schema` 是 MySQL 的**实时性能采集引擎**，纯内存表，重启后清空。它是 `sys` 库的数据来源。
+
+**能查什么：**
+
+| 维度 | 关键表 | 典型问题 |
+|------|--------|---------|
+| **锁** | `data_locks`、`data_lock_waits` | 谁在等锁？谁阻塞的？ |
+| **SQL 统计** | `events_statements_summary_by_digest` | 哪条 SQL 最慢？执行多少次？ |
+| **事务** | `events_transactions_current` | 当前有哪些活跃事务？运行多久了？ |
+| **内存** | `memory_summary_*` | 各模块用了多少内存？峰值多少？ |
+| **文件 IO** | `file_summary_by_instance` | 哪个表 IO 最密集？ |
+| **等待** | `events_waits_current` | 当前等待什么事件？ |
+
+**最常用的查询：**
+
+```sql
+-- 1. 🔴 锁等待排查（最重要的运维场景）
+SELECT
+    r.trx_id                  AS '等待者事务',
+    r.trx_mysql_thread_id     AS '等待者线程ID',
+    b.trx_id                  AS '阻塞者事务',
+    b.trx_mysql_thread_id     AS '阻塞者线程ID',
+    b.trx_query               AS '阻塞者 SQL'
+FROM information_schema.INNODB_LOCK_WAITS w
+JOIN information_schema.INNODB_TRX r ON r.trx_id = w.requesting_trx_id
+JOIN information_schema.INNODB_TRX b ON b.trx_id = w.blocking_trx_id;
+
+-- MySQL 8.0+ 用这个（更精确）
+SELECT
+    waiting_trx_id,
+    waiting_thread_id,
+    blocking_trx_id,
+    blocking_thread_id,
+    wait_age
+FROM performance_schema.data_lock_waits;
+
+-- 2. 当前所有行锁
+SELECT lock_type, lock_mode, lock_status, object_name, lock_data
+FROM performance_schema.data_locks;
+
+-- 3. 找出执行最慢的 10 种 SQL
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR            AS '执行次数',
+    ROUND(AVG_TIMER_WAIT / 1e9, 2) AS '平均耗时(ms)',
+    SUM_ROWS_EXAMINED     AS '扫描行数'
+FROM performance_schema.events_statements_summary_by_digest
+ORDER BY AVG_TIMER_WAIT DESC
+LIMIT 10;
+
+-- 4. 当前活跃事务（长时间未提交的事务是隐患）
+SELECT
+    trx_id,
+    trx_state,
+    trx_mysql_thread_id   AS '线程ID',
+    trx_rows_locked        AS '锁定行数',
+    trx_rows_modified      AS '修改行数',
+    TIMESTAMPDIFF(SECOND, trx_started, NOW()) AS '已运行(秒)'
+FROM information_schema.INNODB_TRX;
+
+-- 5. 哪个文件 IO 最频繁？
+SELECT FILE_NAME,
+       ROUND(SUM_NUMBER_OF_BYTES_READ / 1024 / 1024, 2)  AS '读(MB)',
+       ROUND(SUM_NUMBER_OF_BYTES_WRITE / 1024 / 1024, 2) AS '写(MB)'
+FROM performance_schema.file_summary_by_instance
+ORDER BY SUM_NUMBER_OF_BYTES_READ + SUM_NUMBER_OF_BYTES_WRITE DESC
+LIMIT 10;
+
+-- 6. 确认是否开启
+SHOW VARIABLES LIKE 'performance_schema';  -- ON = 开启
+```
+
+---
+
+### 15.4 sys — 运维诊断
+
+`sys` 库是 MySQL 5.7+ 的**运维辅助库**，把 `performance_schema` 的复杂查询封装成**易读视图 + 函数**。
+
+**为什么要有 sys？手写 `performance_schema` 的查询又长又难记：**
+
+```sql
+-- ❌ performance_schema 原文（几十行 JOIN）
+-- ✅ sys 一句话搞定
+SELECT * FROM sys.statement_analysis ORDER BY total_latency DESC LIMIT 10;
+```
+
+**最常用的视图：**
+
+| 视图 | 作用 | 一句话 |
+|------|------|--------|
+| `statement_analysis` | 所有 SQL 的性能排名 | 哪条 SQL 最耗时间？ |
+| `innodb_lock_waits` | InnoDB 锁等待完整信息 | **谁阻塞了谁？含双方 SQL 内容！** |
+| `schema_unused_indexes` | 从未使用的索引 | 哪些索引可以删？ |
+| `schema_redundant_indexes` | 重复/冗余索引 | 哪些索引是多余的？ |
+| `user_summary` | 每个用户的总 IO/延迟 | 哪个用户最费资源？ |
+| `host_summary` | 每台主机的连接/IO | 哪台机器连接最多？ |
+| `io_global_by_file_by_bytes` | 文件 IO 排名 | 哪个文件的 IO 最密集？ |
+| `memory_global_total` | 全局内存使用 | MySQL 用了多少内存？ |
+| `schema_object_overview` | 各库对象统计 | 每库多少表/视图/存储过程？ |
+
+**常用查询：**
+
+```sql
+-- 1. 🥇 最耗时间的 SQL 排名
+SELECT query, exec_count, total_latency, avg_latency, lock_latency
+FROM sys.statement_analysis
+ORDER BY total_latency DESC LIMIT 10;
+
+-- 2. 🔴 当前锁等待（含双方 SQL 内容！最重要！）
+SELECT
+    waiting_pid          AS '等待者PID',
+    waiting_statement    AS '等待中SQL',
+    blocking_pid         AS '阻塞者PID',
+    blocking_statement   AS '阻塞者SQL'
+FROM sys.innodb_lock_waits;
+
+-- 3. 哪些索引从未被查过？（可安全删除）
+SELECT * FROM sys.schema_unused_indexes
+WHERE object_schema = 'shop';
+
+-- 4. 哪个用户扫描行数最多？（全表扫描大户）
+SELECT user, total_connections, rows_examined, rows_sent
+FROM sys.user_summary
+ORDER BY rows_examined DESC;
+
+-- 5. 整体内存使用
+SELECT * FROM sys.memory_global_total;
+
+-- 6. 哪个表 IO 最重
+SELECT * FROM sys.io_global_by_file_by_bytes
+WHERE file LIKE '%shop%'
+ORDER BY total DESC;
+```
+
+---
+
+### 15.5 四库关系图谱
+
+```
+                        ┌──────────────────────────┐
+                        │       MySQL Server        │
+                        └──────────────────────────┘
+                                       │
+        ┌──────────────┬───────────────┼───────────────┬──────────────┐
+        ▼              ▼               ▼               ▼              ▼
+  ┌──────────┐  ┌────────────────┐ ┌──────────┐  ┌──────────┐
+  │  mysql   │  │information_schema│ │performance│  │   sys    │
+  │           │  │                │ │  _schema │  │          │
+  │ 账号权限  │  │  元数据/定义    │ │  性能指标  │  │ 运维诊断  │
+  │ InnoDB    │  │  MEMORY 临时表  │ │ MEMORY    │  │ 易读视图  │
+  │ 持久化    │  │  只读          │ │ 实时采集  │  │ 封装查询  │
+  └──────────┘  └────────────────┘ └──────────┘  └──────────┘
+        │              │               │               │
+        │              │               └───────┬───────┘
+        │              │                       │
+        │              │              sys 的数据来自
+        │              │              performance_schema
+        │              │              + information_schema
+        │              │
+    GRANT/REVOKE    SHOW CREATE TABLE   先看 sys.xxx
+    改权限           DESC                 解决不了再查
+                    查元数据              performance_schema
+```
+
+| 库 | 记住一句话 | 最常用 |
+|------|----------|--------|
+| `mysql` | **谁能进来？** | `SELECT user, host FROM mysql.user` |
+| `information_schema` | **系统里有什么？** | 查表大小、索引、列定义 |
+| `performance_schema` | **发生了什么？** | 查锁等待、慢 SQL 统计 |
+| `sys` | **翻译成人话** | 一键看锁等待含 SQL 内容 |
+
+**日常排查口诀：**
+
+```
+查权限        → mysql.user
+查表结构/大小 → information_schema.TABLES
+查锁等待      → performance_schema.data_lock_waits
+查慢SQL       → sys.statement_analysis
+锁等待含SQL   → sys.innodb_lock_waits  ← 最好用！
 ```
 
 ---
