@@ -18,9 +18,19 @@
 - [10. 主从与哨兵](#10-主从与哨兵)
 - [11. 集群](#11-集群)
 - [12. 缓存实战](#12-缓存实战)
-- [13. Django 集成](#13-django-集成)
-- [14. Celery 集成](#14-celery-集成)
-- [15. 常见问题排查](#15-常见问题排查)
+- [13. 分布式锁](#13-分布式锁)
+  - [13.1 基础实现 — SET NX EX](#131-基础实现--set-nx-ex)
+  - [13.2 严谨实现 — Lua 原子释放](#132-严谨实现--lua-原子释放)
+  - [13.3 锁续期 (Watchdog)](#133-锁续期-watchdog)
+  - [13.4 生产级封装 — python-redis-lock](#134-生产级封装--python-redis-lock)
+  - [13.5 Redlock — 多节点分布式锁](#135-redlock--多节点分布式锁)
+  - [13.6 基于 ZooKeeper / etcd 的锁](#136-基于-zookeeper--etcd-的锁)
+  - [13.7 数据库悲观锁与乐观锁](#137-数据库悲观锁与乐观锁)
+  - [13.8 分布式锁选型指南](#138-分布式锁选型指南)
+  - [13.9 常见误区与最佳实践](#139-常见误区与最佳实践)
+- [14. Django 集成](#14-django-集成)
+- [15. Celery 集成](#15-celery-集成)
+- [16. 常见问题排查](#16-常见问题排查)
 
 ---
 
@@ -627,7 +637,439 @@ def update_product(product_id, data):
 
 ---
 
-## 13. Django 集成
+## 13. 分布式锁
+
+分布式锁是分布式系统中保证**多进程/多服务互斥访问共享资源**的核心机制。Redis 是实现分布式锁最常用的方案。
+
+### 13.1 基础实现 — SET NX EX
+
+**核心命令**：`SET key value NX EX seconds`
+
+```bash
+# NX = 仅当 key 不存在时设置（Not eXists）
+# EX = 设置过期时间（EXpire），防止死锁
+SET lock:order:123 uuid-token NX EX 10
+# 返回 OK = 获取锁成功，返回 nil = 锁已被占用
+```
+
+**Python 手写版：**
+
+```python
+import redis
+import uuid
+import time
+
+r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+
+class SimpleRedisLock:
+    """基础版分布式锁 — 仅用于理解原理，生产环境别用在关键业务"""
+
+    def __init__(self, key, expire=30):
+        self.client = r
+        self.key = f"lock:{key}"
+        self.expire = expire
+        self.token = uuid.uuid4().hex  # 唯一标识，防止误删别人的锁
+
+    def acquire(self) -> bool:
+        """获取锁"""
+        return self.client.set(self.key, self.token, nx=True, ex=self.expire)
+
+    def release(self):
+        """释放锁（注意：这里释放的是不是自己的锁？）"""
+        # ⚠️ 基础版的问题：直接 DEL 可能误删别人的锁
+        self.client.delete(self.key)
+
+
+# 使用
+lock = SimpleRedisLock("order:123", expire=10)
+if lock.acquire():
+    try:
+        # 执行业务逻辑
+        process_order(123)
+    finally:
+        lock.release()
+else:
+    print("获取锁失败，稍后重试")
+```
+
+> **基础版的致命缺陷**：如果 A 的锁到期自动过期 → B 获取了锁 → A 的 `release()` 删除了 B 的锁！这就是"**锁误删**"问题。
+
+---
+
+### 13.2 严谨实现 — Lua 原子释放
+
+用 **Lua 脚本**保证"判断 + 删除"是原子操作：只有值匹配（证明是自己的锁）才删除。
+
+```python
+class RobustRedisLock:
+    """严谨版分布式锁：Lua 原子释放 + 重试机制"""
+
+    def __init__(self, key, expire=30, retry_times=3, retry_delay=0.1):
+        self.client = r
+        self.key = f"lock:{key}"
+        self.expire = expire
+        self.token = uuid.uuid4().hex
+        self.retry_times = retry_times
+        self.retry_delay = retry_delay
+
+        # Lua 脚本：原子化 "判断值 → 删除"
+        self._release_script = r.register_script("""
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+        """)
+
+    def acquire(self) -> bool:
+        """获取锁，失败则重试"""
+        for _ in range(self.retry_times):
+            if self.client.set(self.key, self.token, nx=True, ex=self.expire):
+                return True
+            time.sleep(self.retry_delay)
+        return False
+
+    def release(self):
+        """Lua 脚本原子释放：只释放自己的锁"""
+        self._release_script(keys=[self.key], args=[self.token])
+
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError(f"获取锁失败: {self.key}")
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+```
+
+**为什么必须用 Lua？**
+
+```
+非原子操作（有风险）：
+  ① GET lock:order    → "token_A"
+  ② 判断 (token == token_A) → TRUE
+  ③ DEL lock:order    → 删除了！
+
+问题：在 ② 和 ③ 之间，token_A 可能已过期，B 获取了 token_B 的锁
+结果：A 误删了 B 的锁！
+
+原子操作（Lua 脚本）：
+  ①②③ 在 Redis 服务端一次性执行完毕，中间不会有其他操作插入 ✅
+```
+
+---
+
+### 13.3 锁续期 (Watchdog)
+
+**问题**：业务执行时间不确定，如果超过 `expire`，锁会提前释放。
+
+**解决**：后台线程定期续期。
+
+```python
+import threading
+
+class AutoRenewLock:
+    """带自动续期的分布式锁"""
+
+    def __init__(self, key, expire=30, renew_interval=None):
+        self.client = r
+        self.key = f"lock:{key}"
+        self.expire = expire
+        self.token = uuid.uuid4().hex
+        self._renew_interval = renew_interval or max(1, expire // 3)  # 每 1/3 过期时间续一次
+        self._renew_thread = None
+        self._renew_stop = threading.Event()
+
+        self._release_script = r.register_script("""
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+        """)
+
+        self._renew_script = r.register_script("""
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("expire", KEYS[1], ARGV[2])
+            else
+                return 0
+            end
+        """)
+
+    def _auto_renew(self):
+        """后台续期线程"""
+        while not self._renew_stop.wait(self._renew_interval):
+            result = self._renew_script(
+                keys=[self.key], args=[self.token, self.expire]
+            )
+            if not result:
+                # 锁已经不属于自己了（被抢占或已过期）
+                break
+
+    def acquire(self) -> bool:
+        if not self.client.set(self.key, self.token, nx=True, ex=self.expire):
+            return False
+
+        # 启动后台续期
+        self._renew_thread = threading.Thread(target=self._auto_renew, daemon=True)
+        self._renew_thread.start()
+        return True
+
+    def release(self):
+        self._renew_stop.set()  # 停止续期
+        if self._renew_thread:
+            self._renew_thread.join(timeout=1)
+        self._release_script(keys=[self.key], args=[self.token])
+
+
+# 使用（上下文管理器）
+lock = AutoRenewLock("long_task", expire=30)
+if lock.acquire():
+    try:
+        time.sleep(60)  # 模拟长任务（锁会自动续期）
+    finally:
+        lock.release()
+```
+
+---
+
+### 13.4 生产级封装 — python-redis-lock
+
+生产环境**直接用现成库**，避免自己造轮子出问题：
+
+```bash
+pip install python-redis-lock
+```
+
+```python
+import redis
+from redis_lock import Lock
+
+r = redis.Redis(host='localhost', port=6379)
+
+# 基础用法
+lock = Lock(r, "order:123", expire=10, auto_renewal=True)
+with lock:
+    # auto_renewal=True: 自动续期，不会因为业务超时而提前释放
+    do_something()
+
+# 非阻塞获取（立即返回）
+lock = Lock(r, "task:export", expire=60)
+if lock.acquire(blocking=False):
+    try:
+        do_export()
+    finally:
+        lock.release()
+else:
+    print("任务正在执行中，跳过")
+
+# 阻塞获取（等待最多 5 秒）
+lock = Lock(r, "task:process", expire=30)
+if lock.acquire(blocking=True, timeout=5):
+    try:
+        do_process()
+    finally:
+        lock.release()
+else:
+    print("5 秒内未获取到锁，放弃")
+```
+
+---
+
+### 13.5 Redlock — 多节点分布式锁
+
+**为什么需要 Redlock？**
+
+单 Redis 节点：Master 宕机 → Slave 提升 → 锁可能丢失（主从复制是异步的）。
+
+Redlock 算法：向 **N 个独立 Redis 节点**（推荐 5 个）依次获取锁，大多数（>= N/2+1）同意才算成功。
+
+```bash
+pip install redlock-py
+```
+
+```python
+from redlock import Redlock
+
+# 连接 5 个独立 Redis 节点
+dlm = Redlock([
+    {"host": "redis-node-1", "port": 6379},
+    {"host": "redis-node-2", "port": 6379},
+    {"host": "redis-node-3", "port": 6379},
+    {"host": "redis-node-4", "port": 6379},
+    {"host": "redis-node-5", "port": 6379},
+])
+
+# 获取锁
+lock = dlm.lock("critical:resource", ttl=10000)  # TTL 单位毫秒
+if lock:
+    try:
+        do_critical_operation()
+    finally:
+        dlm.unlock(lock)
+else:
+    print("获取锁失败")
+```
+
+| 方案 | 可靠性 | 性能 | 适用场景 |
+|------|--------|------|---------|
+| 单节点 Redis | 中 | 高 | 日常开发（90% 场景） |
+| Redlock | 高 | 中 | 金融、支付关键业务 |
+| Redis Cluster | 中 | 高 | 不是为锁设计的，不推荐直接用 |
+
+---
+
+### 13.6 基于 ZooKeeper / etcd 的锁
+
+当 Redis 的 AP 特性不够时，用 CP 一致性系统。
+
+**ZooKeeper（kazoo）：**
+
+```bash
+pip install kazoo
+```
+
+```python
+from kazoo.client import KazooClient
+from kazoo.recipe.lock import Lock
+
+zk = KazooClient(hosts='localhost:2181')
+zk.start()
+
+lock = zk.Lock("/locks/order:123", "identifier")
+
+with lock:
+    # ZK 保证：只有持锁者才能执行
+    # 特性：临时顺序节点 + Watch 机制，天然防死锁
+    do_critical_work()
+```
+
+**etcd（etcd3）：**
+
+```bash
+pip install etcd3
+```
+
+```python
+import etcd3
+
+client = etcd3.client(host='localhost', port=2379)
+
+lock = client.lock("order:123", ttl=10)
+
+with lock:
+    # etcd 使用 Lease 租约机制，过时自动释放
+    do_work()
+```
+
+---
+
+### 13.7 数据库悲观锁与乐观锁
+
+当没有 Redis/ZK 等中间件时，直接利用数据库。
+
+**悲观锁（`SELECT ... FOR UPDATE`）：**
+
+```python
+# Django 示例
+from django.db import transaction
+
+with transaction.atomic():
+    # FOR UPDATE = 行级排他锁，阻塞其他事务读取
+    order = Order.objects.select_for_update().get(id=123)
+
+    if order.status == 'pending':
+        order.status = 'processing'
+        order.save()
+    # 事务提交后释放锁
+```
+
+**乐观锁（版本号 / 时间戳）：**
+
+```python
+# 不阻塞，冲突时重试
+affected = Product.objects.filter(
+    id=1,
+    stock__gte=1,              # 库存充足
+    version=current_version,    # 版本号匹配
+).update(
+    stock=models.F('stock') - 1,
+    version=current_version + 1,
+)
+
+if affected == 0:
+    # 被其他进程抢先了，重试
+    raise RetryException("请重试")
+```
+
+---
+
+### 13.8 分布式锁选型指南
+
+```
+                        需要分布式锁
+                            │
+            ┌───────────────┼───────────────┐
+            ▼               ▼               ▼
+        已有 Redis？    已有 ZK/etcd？   只有数据库？
+            │               │               │
+            ▼               ▼               ▼
+     ┌──────────┐   ┌──────────┐   ┌──────────┐
+     │单节点Redis│   │kazoo/etcd3│  │悲观锁/乐观锁│
+     │(90%场景)  │   │(强一致性) │   │(无额外组件)│
+     └──────────┘   └──────────┘   └──────────┘
+            │
+     是否关键业务？
+        │       │
+        ▼       ▼
+     简单业务   金融/支付
+    单节点锁   Redlock
+```
+
+| 方案 | 可靠性 | 性能 | 复杂度 | 典型场景 |
+|------|--------|------|--------|---------|
+| **Redis 单节点** | 中 | 高 | 低 | 通用场景，**首选** |
+| **Redis Redlock** | 高 | 中 | 中 | 需要高可靠性的关键业务 |
+| **ZooKeeper** | 极高（CP） | 低 | 中 | 金融、强一致性场景 |
+| **etcd** | 极高（CP） | 低 | 中 | K8s 环境、强一致性场景 |
+| **数据库行锁** | 中 | 低 | 低 | 无中间件时的兜底方案 |
+| **数据库乐观锁** | 中 | 中 | 低 | 读多写少、冲突少的场景 |
+
+---
+
+### 13.9 常见误区与最佳实践
+
+| 误区 | 真相 |
+|------|------|
+| "SETNX + EXPIRE 就够了" | 这不是原子操作！SETNX 后宕机 → 死锁。必须用 `SET ... NX EX` 一次完成 |
+| "DEL 删除锁就行" | 可能误删别人的锁！必须用 Lua 脚本"先判断值再删除" |
+| "过期时间设长一点就不会有问题" | 进程崩溃会持有锁直到过期，阻塞所有竞争者。设合理的 expire + 续期机制 |
+| "Redis 做锁肯定不丢" | Redis 主从异步复制，主宕机锁可能丢。关键业务用 Redlock |
+| "分布式锁保证绝对互斥" | 即使是 Redlock，极端情况下也可能不互斥（时钟跳跃、GC 暂停）。业务层必须做好并发兼容 |
+
+**一段代码记忆所有要点：**
+
+```python
+# 一个严谨的分布式锁必须具备的 5 个要素
+
+# ① 防死锁：一口气设置 NX + EX
+acquired = r.set("lock:key", token, nx=True, ex=10)
+
+# ② 防误删：Lua 原子化释放（只删自己的锁）
+release = r.register_script("""
+    if redis.call("get",KEYS[1]) == ARGV[1] then
+        return redis.call("del",KEYS[1])
+    else return 0 end
+""")
+
+# ③ 防超时：后台续期（Watchdog 线程）
+# ④ 防饥饿：获取失败要重试（retry）
+# ⑤ 业务幂等：有了并发，业务本身必须支持幂等
+```
+
+---
+
+## 14. Django 集成
 
 ```bash
 pip install redis django-redis
@@ -715,57 +1157,16 @@ conn.brpop("queue", timeout=5)
 
 ---
 
-## 14. Celery 集成
+## 15. Celery 集成
 
 ```python
-# settings.py
 CELERY_BROKER_URL = "redis://127.0.0.1:6379/0"      # 任务队列
 CELERY_RESULT_BACKEND = "redis://127.0.0.1:6379/2"   # 结果存储
 ```
 
-```python
-# 分布式锁（Django 项目中使用 Redlock）
-import redis
-import uuid
-import time
-
-class RedisLock:
-    """基于 Redis 的分布式锁"""
-
-    def __init__(self, client, key, expire=30):
-        self.client = client
-        self.key = f"lock:{key}"
-        self.expire = expire
-        self.token = str(uuid.uuid4())
-
-    def __enter__(self):
-        # 循环获取锁
-        while True:
-            if self.client.set(self.key, self.token, nx=True, ex=self.expire):
-                return self
-            time.sleep(0.1)
-
-    def __exit__(self, *args):
-        # Lua 脚本保证原子性：只有持锁者才能释放
-        script = """
-        if redis.call("get", KEYS[1]) == ARGV[1] then
-            return redis.call("del", KEYS[1])
-        else
-            return 0
-        end
-        """
-        self.client.eval(script, 1, self.key, self.token)
-
-# 使用
-r = redis.Redis()
-with RedisLock(r, "order:123", expire=30):
-    # 业务逻辑（同一时间只有一个进程能执行）
-    process_order(123)
-```
-
 ---
 
-## 15. 常见问题排查
+## 16. 常见问题排查
 
 ```bash
 # 查看所有配置

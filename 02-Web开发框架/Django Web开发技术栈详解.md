@@ -1164,79 +1164,400 @@ def login(request):
     # 返回 Token...
 ```
 
-### 场景 3：分布式锁 — 秒杀/抢单
+### 场景 3：分布式锁 — 四种方案完整实现
+
+**需求**：在多 Gunicorn Worker / 多服务器环境下，保证同一商品同一时间只能被一个用户成功下单（防超卖）。
+
+#### 方案对比一览
+
+| 方案 | 原理 | 可靠性 | 性能 | 适用场景 |
+|------|------|--------|------|---------|
+| **Redis 分布式锁** | SET NX EX + Lua 释放 | 中 | 高 | 通用，**首选** |
+| **select_for_update 行锁** | 数据库行级 X 锁 | 高 | 低 | 小并发、已有事务保护 |
+| **乐观锁（版本号）** | WHERE version=旧值 | 中 | 高 | 读多写少、冲突少 |
+| **Celery 任务去重锁** | Redis 锁 + Celery 幂等 | 中 | 高 | 异步任务防重 |
+
+---
+
+#### 方案 1：Redis 分布式锁（推荐）
+
+完整实现一个生产级的 Redis 锁，包含 **原子获取、Lua 释放、自动续期、重试机制**：
 
 ```python
 """需求：秒杀场景，同一商品同一时间只能有一个用户下单成功。"""
 import uuid
+import time
+import threading
 from django.core.cache import cache
 
-class RedisLock:
-    """基于 Redis SETNX 的分布式锁（解决多 Gunicorn Worker 并发问题）"""
+class RedisDistributedLock:
+    """
+    基于 Redis SETNX 的生产级分布式锁。
 
-    def __init__(self, key, expire=30, retry_times=5, retry_interval=0.1):
-        self.key = f'lock:{key}'
+    核心要点：
+    1. SET key token NX EX — 原子获取 + 防死锁
+    2. Lua 原子释放 — 只删除自己的锁（防误删）
+    3. Watchdog 续期 — 业务执行太久自动续锁
+    4. 重试机制 — 获取失败不立即放弃
+    """
+
+    def __init__(self, key, expire=30, retry_times=3, retry_delay=0.1):
+        self.key = f"lock:{key}"
         self.expire = expire
-        self.token = str(uuid.uuid4())
+        self.token = uuid.uuid4().hex
         self.retry_times = retry_times
-        self.retry_interval = retry_interval
+        self.retry_delay = retry_delay
+        self._renew_thread = None
+        self._renew_stop = threading.Event()
 
+        # 获取底层 Redis 连接（绕过 Django Cache 抽象）
+        from django_redis import get_redis_connection
+        self.redis = get_redis_connection("default")
+
+        # Lua 脚本：原子释放（只释放自己的锁）
+        self._release_lua = self.redis.register_script("""
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+        """)
+
+        # Lua 脚本：续期
+        self._renew_lua = self.redis.register_script("""
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("expire", KEYS[1], ARGV[2])
+            else
+                return 0
+            end
+        """)
+
+    # ===== 获取锁 =====
     def acquire(self) -> bool:
-        """获取锁（带重试）"""
-        for _ in range(self.retry_times):
-            # SET key token NX EX expire
-            if cache.add(self.key, self.token, self.expire):
+        """尝试获取锁，支持重试"""
+        for attempt in range(self.retry_times):
+            # SET key token NX EX — 原子操作
+            if self.redis.set(self.key, self.token, nx=True, ex=self.expire):
+                self._start_auto_renew()
                 return True
-            time.sleep(self.retry_interval)
+            time.sleep(self.retry_delay)
         return False
 
+    # ===== 释放锁 =====
     def release(self):
-        """释放锁（Lua 脚本保证原子性：只有持锁者才能放）"""
-        # 这里用 cache 的原子操作
-        current = cache.get(self.key)
-        if current == self.token:
-            cache.delete(self.key)
+        """原子释放锁"""
+        self._stop_auto_renew()
+        self._release_lua(keys=[self.key], args=[self.token])
+
+    # ===== 自动续期（Watchdog）=====
+    def _start_auto_renew(self):
+        """启动后台续期线程"""
+        interval = max(1, self.expire // 3)
+
+        def _renew():
+            while not self._renew_stop.wait(interval):
+                result = self._renew_lua(keys=[self.key], args=[self.token, self.expire])
+                if not result:
+                    break  # 锁已不属于自己，停止续期
+
+        self._renew_thread = threading.Thread(target=_renew, daemon=True)
+        self._renew_thread.start()
+
+    def _stop_auto_renew(self):
+        self._renew_stop.set()
+        if self._renew_thread:
+            self._renew_thread.join(timeout=1)
+
+    # ===== 上下文管理器 =====
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError(f"获取锁失败: {self.key}")
+        return self
+
+    def __exit__(self, *args):
+        self.release()
 
 
 class SeckillService:
-    """秒杀服务"""
+    """秒杀服务 — 使用 Redis 分布式锁"""
 
     @staticmethod
-    def place_seckill_order(user_id, product_id):
-        """秒杀下单"""
-        lock_key = f'seckill:product:{product_id}'
-        lock = RedisLock(lock_key, expire=10)
+    def place_seckill_order(user_id: int, product_id: int):
+        """秒杀下单（Redis 分布式锁保护）"""
+        lock = RedisDistributedLock(f"seckill:product:{product_id}", expire=10)
 
         # 1. 获取分布式锁
         if not lock.acquire():
             return {'success': False, 'error': '抢购人数太多，请稍后再试'}
 
         try:
-            # 2. 检查库存
+            # 2. 检查 + 扣减（锁内操作）
+            with transaction.atomic():
+                # select_for_update 双保险：锁内再用行锁
+                product = Product.objects.select_for_update().get(id=product_id)
+
+                if product.stock < 1:
+                    return {'success': False, 'error': '已售罄'}
+
+                # 检查是否已抢过（同一用户限购 1 件）
+                if OrderItem.objects.filter(
+                    order__user_id=user_id,
+                    product_id=product_id,
+                ).exists():
+                    return {'success': False, 'error': '每人限购 1 件'}
+
+                # 扣库存
+                product.stock -= 1
+                product.save(update_fields=['stock'])
+
+                # 创建订单
+                order = Order.objects.create(
+                    user_id=user_id,
+                    total_amount=product.seckill_price,
+                )
+                OrderItem.objects.create(
+                    order=order,
+                    product=product,
+                    quantity=1,
+                    price=product.seckill_price,
+                )
+
+            return {
+                'success': True,
+                'order_id': order.id,
+                'price': float(product.seckill_price),
+            }
+
+        finally:
+            lock.release()  # 无论成功失败，释放锁
+
+    @staticmethod
+    def place_seckill_order_with_retry(user_id: int, product_id: int, max_retries: int = 3):
+        """带重试的秒杀（应对瞬时高并发）"""
+        for attempt in range(max_retries):
+            result = SeckillService.place_seckill_order(user_id, product_id)
+            if result['success']:
+                return result
+            if result['error'] == '已售罄':
+                return result  # 库存没了，不必重试
+            time.sleep(0.05)  # 换锁失败，等 50ms 重试
+        return {'success': False, 'error': '系统繁忙，请稍后再试'}
+```
+
+---
+
+#### 方案 2：select_for_update 行级锁（数据库悲观锁）
+
+适合**并发不高**或需要配合数据库事务的场景：
+
+```python
+from django.db import transaction
+from django.db.models import F
+
+class SeckillWithDBLock:
+    """秒杀 — select_for_update 行级锁"""
+
+    @staticmethod
+    def place_order(user_id: int, product_id: int):
+        """
+        select_for_update 原理：
+        - SELECT ... FOR UPDATE = 对查询到的行加 X 锁
+        - 其他事务的 SELECT ... FOR UPDATE 会阻塞
+        - 事务提交后释放锁
+        """
+        try:
+            with transaction.atomic():
+                # ⚠️ 关键：select_for_update 在 transaction.atomic() 内才生效
+                product = Product.objects.select_for_update().get(id=product_id)
+
+                if product.stock < 1:
+                    return {'success': False, 'error': '已售罄'}
+
+                # 直接 update（不需要再 save，利用 F 表达式原子扣减）
+                Product.objects.filter(
+                    id=product_id, stock__gte=1
+                ).update(stock=F('stock') - 1)
+
+                order = Order.objects.create(user_id=user_id, total_amount=100)
+                OrderItem.objects.create(order=order, product_id=product_id, quantity=1, price=100)
+
+            return {'success': True, 'order_id': order.id}
+
+        except Product.DoesNotExist:
+            return {'success': False, 'error': '商品不存在'}
+
+    # 对比：不加锁的后果
+    @staticmethod
+    def place_order_unsafe(user_id: int, product_id: int):
+        """❌ 不安全：先读后写，并发时会超卖"""
+        product = Product.objects.get(id=product_id)
+
+        if product.stock < 1:
+            return {'success': False, 'error': '已售罄'}
+
+        # ⚠️ 竞态窗口：多个线程可能同时读到 stock >= 1
+        product.stock -= 1
+        product.save()
+
+        # 结果：可能超卖！
+        return {'success': True}
+```
+
+**select_for_update 注意事项：**
+
+```python
+# ✅ 正确：在 transaction.atomic() 上下文中使用
+with transaction.atomic():
+    obj = Product.objects.select_for_update().get(id=1)
+
+# ❌ 错误：在事务外使用（FOR UPDATE 立刻释放，等同于没锁）
+obj = Product.objects.select_for_update().get(id=1)
+
+# ✅ 正确：只锁需要的行（WHERE 条件走索引）
+Product.objects.select_for_update().filter(id__in=[1, 2, 3])
+
+# ❌ 错误：没有索引的 WHERE（会导致全表锁！）
+Product.objects.select_for_update().filter(name='iPhone')
+# 如果 name 列没有索引 → 全表扫描 → 锁全表
+```
+
+---
+
+#### 方案 3：乐观锁（版本号 / 时间戳）
+
+**不阻塞，冲突时重试**，适合读多写少的场景：
+
+```python
+from django.db.models import F
+
+class SeckillWithOptimisticLock:
+    """秒杀 — 乐观锁（版本号机制）"""
+
+    @staticmethod
+    def place_order(user_id: int, product_id: int, max_retries: int = 5):
+        """
+        乐观锁流程：
+        1. 读取当前版本号
+        2. UPDATE WHERE version=旧值（原子操作）
+        3. 如果 affected_rows = 0 → 被抢先了 → 重试
+        """
+        for attempt in range(max_retries):
+            # 读取当前数据和版本号
             product = Product.objects.get(id=product_id)
             if product.stock < 1:
                 return {'success': False, 'error': '已售罄'}
 
-            # 3. 检查是否已抢过（同一用户限购 1 件）
-            if Order.objects.filter(
-                user_id=user_id, product_id=product_id,
-                created_at__date=date.today(),
-            ).exists():
-                return {'success': False, 'error': '每人限购 1 件'}
+            # 原子更新：只有 version 匹配才执行
+            affected = Product.objects.filter(
+                id=product_id,
+                version=product.version,  # ⚠️ 关键：带上旧版本号
+                stock__gte=1,
+            ).update(
+                stock=F('stock') - 1,
+                version=F('version') + 1,  # 版本号 +1
+            )
 
-            # 4. 扣库存 + 创建订单
-            product.stock -= 1
-            product.save(update_fields=['stock'])
+            if affected > 0:
+                # 成功
+                order = Order.objects.create(user_id=user_id, total_amount=100)
+                return {'success': True, 'order_id': order.id}
 
-            order = Order.objects.create(user_id=user_id, total_amount=product.seckill_price)
+            # affected = 0 → 被其他请求抢先了，重试
+            # 可以加短暂随机等待，减少冲突
+            time.sleep(0.01 * random.randint(1, 5))
 
-            return {'success': True, 'order_id': order.id, 'price': product.seckill_price}
+        return {'success': False, 'error': '系统繁忙，请稍后重试'}
+```
 
-        finally:
-            lock.release()
+**Model 定义：**
 
-# 调用
-# result = SeckillService.place_seckill_order(user_id=123, product_id=456)
+```python
+class Product(models.Model):
+    title = models.CharField(max_length=200)
+    stock = models.IntegerField(default=0)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    version = models.IntegerField(default=0)  # 乐观锁版本号
+```
+
+---
+
+#### 方案 4：Celery 任务去重锁（防止任务重复执行）
+
+```python
+from celery import shared_task
+from django_redis import get_redis_connection
+
+@shared_task(bind=True)
+def process_refund(self, order_id):
+    """退款处理 — 防止同一订单被多个 worker 重复处理"""
+    redis = get_redis_connection("default")
+    lock_key = f"task:refund:{order_id}"
+    lock_token = uuid.uuid4().hex
+
+    # 尝试获取分布式锁
+    if not redis.set(lock_key, lock_token, nx=True, ex=300):
+        return f"退款任务已在执行中，跳过: {order_id}"
+
+    try:
+        # 执行退款逻辑
+        with transaction.atomic():
+            order = Order.objects.select_for_update().get(id=order_id)
+            if order.status != 'paid':
+                return f"订单状态不是已支付，无法退款"
+
+            # 退款...
+            order.status = 'refunded'
+            order.save()
+
+            # 恢复库存
+            for item in order.items.all():
+                Product.objects.filter(id=item.product_id).update(
+                    stock=F('stock') + item.quantity
+                )
+
+        return f"退款成功: {order_id}"
+
+    except Exception as e:
+        logger.error(f"退款失败 {order_id}: {e}")
+        raise
+
+    finally:
+        # Lua 原子释放锁
+        script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+        """
+        redis.eval(script, 1, lock_key, lock_token)
+```
+
+---
+
+#### 四种方案选型总结
+
+```
+                        并发抢单/任务去重
+                            │
+            ┌───────────────┼───────────────┐
+            ▼               ▼               ▼
+       有 Redis？      只用数据库？     需事务保障？
+            │               │               │
+            ▼               ▼               ▼
+    ┌──────────────┐ ┌──────────┐ ┌──────────────┐
+    │Redis分布式锁  │ │ 乐观锁    │ │select_for   │
+    │(首选，高性能) │ │(版本号)   │ │update 行锁   │
+    └──────────────┘ └──────────┘ └──────────────┘
+            │               │               │
+    适用：高并发抢购  适用：个人资料修改 适用：余额扣减
+          秒杀活动       库存非热点数据   订单状态变更
+
+选型口诀：
+- 高并发 → Redis 分布式锁
+- 有事务 → select_for_update 行锁
+- 低冲突 → 乐观锁（版本号）
+- 异步任务 → Redis 锁 + 任务幂等
 ```
 
 ---
