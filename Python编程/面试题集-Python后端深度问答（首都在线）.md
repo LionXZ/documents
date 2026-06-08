@@ -2298,188 +2298,364 @@ def schedule_full_backups():
 
 **场景理解：**
 
-用户登录 GIC 控制台 → 点击"创建云盘" → 选大小/类型/计费方式 → 确认。后端要做的事：
+用户登录控制台 → 点击"挂载云盘" → 选云盘 + 目标 ECS → 确认。背后经过两层服务：
 
 ```
-前端请求
-  → gic-business: 参数校验 + 价格计算 + 鉴权
-  → ebs-service: 调用 ebs-service 底层执行创建
-  → ecs-service: 事件→子任务→虚拟化层→轮询完成
-  → 状态更新
+GIC 前端 → gic-business (View→Backend→HTTP Client) → ecs-service (事件→Spooler→虚拟化)
 ```
 
-### 2.1 gic-business 层：EbsView + OpenAPI 网关
+### 2.1 gic-business 层：EbsView 的真实代码
 
-用户控制台的 API 在 `gic-business/apps/api/views/ebs.py`（22 个端点）和 `multi_ebs.py`（20 个多云端点）。
+用户控制台的 API 在 `gic-business/apps/api/views/ebs.py`，真实代码长这样：
 
 ```python
-# gic-business 的 EbsView 核心端点
-class EbsView:
-    # 云盘 CRUD
-    def create_ebs():     # POST /gic_business/v1/ebs/create_ebs/
-    def destroy_ebs():    # DELETE 删除云盘
-    def expansion_ebs():  # PUT 扩容
+# gic-business/apps/api/views/ebs.py — 真实源码
+from rest_framework.viewsets import GenericViewSet
+from rest_framework.decorators import action
+from apps.api.serializers.ebs import (
+    DiskMountSerializer, DiskCreateSerializer, DiskExpansionSerializer,
+    BatchOperateDiskBaseSerializer, GetCloudDiskListSerializer, ...
+)
+from apps.api.backend.ebs_service import EbsOperateService, DiskService, EbsDataService
 
-    # 挂载与卸载
-    def mount_ebs():      # POST 挂载到 ECS
-    def unmount_ebs():    # POST 从 ECS 卸载
 
-    # 查询
-    def get_ebs_list():   # GET 云盘列表
-    def get_ebs_detail(): # GET 云盘详情
-    def get_ebs_price():  # GET 价格查询（按容量/类型/计费方式）
+class EbsView(GenericViewSet):
+
+    @action(methods=['POST'], url_path='mount', detail=False,
+            serializer_class=DiskMountSerializer)
+    @login_required
+    @response
+    def mount(self, req, data):
+        """云盘挂载"""
+        op = EbsOperateService(data)
+        res = op.api_mount_ebs(data)
+        return res
+
+    @action(methods=['POST'], url_path='unmount', detail=False,
+            serializer_class=BatchOperateDiskBaseSerializer)
+    @login_required
+    @response
+    def unmount(self, req, data):
+        """云盘卸载"""
+        op = EbsOperateService(data)
+        res = op.api_unmount_ebs(data)
+        return res
+
+    @action(methods=['POST'], url_path='expansion', detail=False,
+            serializer_class=DiskExpansionSerializer)
+    @login_required
+    @response
+    def expansion(self, req, data):
+        """云盘扩容"""
+        op = EbsOperateService(data)
+        res = op.api_expansion_ebs(data)
+        return res
+
+    @action(methods=['POST'], url_path='create_disk', detail=False,
+            serializer_class=DiskCreateSerializer)
+    @login_required
+    @response
+    def create_disk(self, req, data):
+        """云盘创建"""
+        op = EbsOperateService(data)
+        res = op.api_create_ebs(data)
+        return res
 ```
 
-每个 View 方法的流程都是一样的：
+View 层的设计非常简单——**每个 action 只有三行**：创建 Service 实例 → 调 Backend 方法 → 返回结果。参数校验由 `@response` 装饰器结合 DRF 的 Serializer 自动完成，不需要在 View 里写。
+
+### 2.2 gic-business Backend 层：真实的业务逻辑
+
+`gic-business/apps/api/backend/ebs_service.py` 是真正的业务逻辑层：
 
 ```python
-def create_ebs(self, request):
-    # 1. Serializer 参数校验（大小/类型/计费方式/region）
-    serializer = CreateEbsSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
+# gic-business/apps/api/backend/ebs_service.py — 真实源码
+from utils.request_service import EbsServiceRequest
 
-    # 2. 调用 Backend 层做业务逻辑（价格计算、库存检查）
-    result = ebs_backend.create_ebs(serializer.validated_data)
+class EbsOperateService(BasicService):
 
-    # 3. 返回给前端
-    return Response(result)
+    @catch_business_exception('云盘挂载')
+    def api_mount_ebs(self, data):
+        logger.info('云盘挂载参数：{}'.format(data))
+
+        # 1. 权限校验：检查 ECS 和云盘是否属于当前用户
+        ecs_id = data['ecs_id']
+        disk_ids = data['disk_ids']
+        self.check_customer_ecs([ecs_id])
+        self.check_customer_disks(disk_ids)
+        self.check_disks_is_follow_delete(disk_ids, data.get('is_follow_delete', False))
+
+        # 2. 组装参数
+        params = {
+            'customer_id': self.customer_id,
+            'ecs_id': ecs_id,
+            'disk_ids': disk_ids,
+            'is_follow_delete': data.get('is_follow_delete', False),
+            'op_user': self.op_user,
+            'op_source': self.op_source,
+            'host_id': data.get('host_id', ''),
+            'product_source': data.get('product_source', '')
+        }
+
+        # 3. 调下游 HTTP 客户端 → ecs-service
+        res_data = EbsServiceRequest.disk_mount_info(params)
+        return BusinessReturn(ReturnCodeMsg.SUCCESS, '云盘挂载成功！', res_data)
+
+    @catch_business_exception('云盘扩容')
+    def api_expansion_ebs(self, data):
+        logger.info('云盘扩容参数：{}'.format(data))
+        params = {
+            'customer_id': self.customer_id,
+            'expansion_info': data.get('expansion_info'),
+            'billing_info': data.get('billing_info'),
+            'op_user': self.op_user,
+            'op_source': self.op_source,
+            'az_id': data.get('az_id')
+        }
+        res_data = EbsServiceRequest.disk_expansion_info(params)
+        return BusinessReturn(ReturnCodeMsg.SUCCESS, '云盘扩容成功！', res_data)
 ```
 
-> **要点：View 层只做三件事——校验参数、调 Backend、返回结果。业务逻辑全部在 Backend 层。**
+### 2.3 HTTP 客户端层：EbsServiceRequest
 
-### 2.2 OpenAPI 网关——对外暴露标准 API
-
-gic-business 的另一个独特设计是 OpenAPI 网关。外部系统（比如客户自己的脚本）通过**统一的 action 参数**调用我们的云平台：
+`gic-business/utils/request_service.py` 封装了对下游 ecs-service（也叫 ebs-service）的 HTTP 调用：
 
 ```python
-# 客户请求
-POST /v1/
-{
-    "Action": "CreateDisk",      # ← 通过 action 分发
-    "DiskName": "my-disk",
-    "DiskSize": 100,
-    "DiskType": "SSD"
-}
+# 真实源码 — 所有 EBS 相关 API 的 HTTP 端点定义
+class EbsServiceRequest(BusinessRequest):
+    EBS_SERVICE_URL = settings.EBS_SERVICE_URL
 
-# 网关分发
-class OpenApiEbsViews:
-    ACTION_MAP = {
-        "CreateDisk":      "create_disk",
-        "AttachDisk":      "mount_disk",       # 挂载
-        "DetachDisk":      "unmount_disk",      # 卸载
-        "ResizeDisk":      "expansion_disk",    # 扩容
-        "DeleteDisk":      "destroy_disk",      # 删除
-        "DescribeDisks":   "get_disk_list",     # 查询
-    }
+    # 每个操作对应一个下游 URL
+    DISK_MOUNT_URL    = urljoin(EBS_SERVICE_URL, '/ebs_service/v1/ebs/mount/')
+    DISK_UNMOUNT_URL  = urljoin(EBS_SERVICE_URL, '/ebs_service/v1/ebs/unmount/')
+    DISK_CREATE_URL   = urljoin(EBS_SERVICE_URL, '/ebs_service/v1/ebs/api_create_disk/')
+    DISK_UPDATE_URL   = urljoin(EBS_SERVICE_URL, '/ebs_service/v1/ebs/expansion/')
+    DISK_DESTROY_URL  = urljoin(EBS_SERVICE_URL, '/ebs_service/v1/ebs/destroy_disk/')
+    EBS_PRICE_URL     = urljoin(EBS_SERVICE_URL, '/ebs_service/v1/ebs_data/get_ebs_price/')
+    DISK_LIMIT_URL    = urljoin(EBS_SERVICE_URL, '/ebs_service/v1/ebs/get_disk_limit/')
+    # ... 30+ 个端点
+
+    @classmethod
+    def disk_mount_info(cls, param):
+        return cls.post(cls.DISK_MOUNT_URL, param)
+
+    @classmethod
+    def disk_unmount_info(cls, param):
+        return cls.post(cls.DISK_UNMOUNT_URL, param)
+
+    @classmethod
+    def disk_create_ebs(cls, param):
+        return cls.post(cls.DISK_CREATE_URL, param)
+
+    @classmethod
+    def disk_expansion_info(cls, param):
+        return cls.post(cls.DISK_UPDATE_URL, param)
 ```
 
-**面试话术：**
+### 2.4 ecs-service 层：DiskEventSet 事件处理
 
-> "OpenAPI 网关的设计思路是**action 分发模式**——用一个入口承接所有外部 API 请求，通过 `Action` 参数路由到对应的处理方法。这样做的好处是：对外接口简洁，一个 URL 搞定所有；对内增加了安全层，在网关统一做签名验证和频率限制。gic-business 有 30+ 种 action，覆盖了 ECS、EBS、快照、镜像等所有资源。"
-
-### 2.3 ecs-service 层：异步执行云盘操作
-
-云盘创建/挂载/扩容这些不是瞬间完成的（需要几秒到几十秒），必须异步执行。ecs-service 用 **uWSGI Spooler** 做异步任务引擎：
+请求到达 ecs-service 后，`spool_service/event_service/ebs_event_service.py` 的 `DiskEventSet.common_init_ebs_event()` 负责拆解事件为子任务：
 
 ```python
-# 简化后的 Spooler 事件处理流程
+# ecs-service/spool_service/event_service/ebs_event_service.py — 真实源码
+class DiskEventSet(object):
 
-# 1. View 层接收请求 → 创建事件记录
-def create_ebs(request):
-    event = CloudOsEvent.objects.create(
-        event_type="create_ebs",
-        status="pending",
-        params=request.data,    # 用户参数（大小、类型等）
-    )
-    return {"event_id": event.id, "status": "processing"}
-    # ⚠ 注意：这里立即返回，不阻塞等待创建完成
+    @classmethod
+    def common_init_ebs_event(cls, event):
+        event_type = event.event_type               # 事件类型（挂载/卸载/扩容/删除）
+        event_param = event.event_param             # 请求参数
+        disk_ids = event_param['disk_ids']          # 云盘ID列表
+        customer_id = event.customer_id
 
-# 2. Spool Consumer 轮询事件表
-def spool_consumer():
-    while True:
-        events = CloudOsEvent.objects.filter(status="pending")
-        for event in events:
-            event.status = "processing"
-            event.save()
+        disk_queryset = CloudOsDisk.objects.select_related('az__region', 'ecs_goods').filter(
+            disk_id__in=disk_ids, is_valid=True)
 
-            # 3. 拆分子任务（按事件类型路由到不同处理器）
-            handler = get_event_handler(event.event_type)
-            subtasks = handler.generate_tasks(event)      # 生成子任务列表
+        for disk in disk_queryset:
+            resource_id = disk.disk_id
+            region_id = disk.az.region_id           # 从关联表获取 region
+            az_code = disk.az.az_code
+            disk_type = disk.ecs_goods.feature.lower()  # SSD / HDD
 
-            # 4. 依次执行子任务
-            for task in subtasks:
-                result = task.execute()                   # 调用虚拟化层
-                if not result.success:
-                    retry_or_fail(task)
-                    break
+            global_context = {
+                'customer_id': customer_id,
+                'volume_info': [{
+                    'uuid': resource_id,
+                    'disk_type': disk_type
+                }]
+            }
+
+            # ===== 根据事件类型设置不同的上下文 =====
+            if event_type == EbsEventType.MOUNT_DISK:
+                # 挂载：需要 ecs_id + attach_flag + order
+                ecs_id = event_param['ecs_id']
+                global_context['instance_id'] = ecs_id
+                global_context['volume_info'][0]['attach_flag'] = EbsAttachFlagType.ATTACH
+                global_context['volume_info'][0]['order'] = order
+
+            elif event_type == EbsEventType.UNMOUNT_DISK:
+                # 卸载：从 disk 对象上取已挂载的 ecs_id
+                ecs_id = disk.ecs_id
+                global_context['instance_id'] = ecs_id
+                global_context['volume_info'][0]['attach_flag'] = EbsAttachFlagType.UNLOAD
+
+            elif event_type == EbsEventType.UPDATE_DISK:
+                # 扩容：传入新大小 + iops + 带宽
+                expansion_config = event_param['disk_expanded_info'][resource_id]
+                global_context['volume_info'][0]['size'] = expansion_config['size']
+                global_context['volume_info'][0]['iops'] = expansion_config.get('iops', 0)
+                global_context['volume_info'][0]['band_mbps'] = expansion_config.get('storage', 0)
+
+            elif event_type == EbsEventType.DELETE_DISK:
+                # 逻辑删除：如果已挂载，先卸载再删
+                if disk.ecs_id and recycling_info:
+                    global_context['instance_id'] = disk.ecs_id
+                    global_context['volume_info'][0]['attach_flag'] = EbsAttachFlagType.UNLOAD
+                    maintask_name = EVENT_MAIN_TASK_DICT[EbsEventType.DETACH_DELETE_DISK]
+
+            # 生成 Task 对象，写入 CloudOsTask 表
+            task_param = gen_task_param(maintask_name, ResourceType.EBS, resource_id,
+                                        region_id, az_code, customer_id, global_context)
+            task_id = create_uuid()
+            ebs_task = gen_task_instance(task_id, resource_id, az_id, customer_id, now,
+                                         event, event_type, task_param, EcsCloudType.EBS)
+            ebs_task_list.append(ebs_task)
+```
+
+### 2.5 EbsTaskSet — 任务执行与失败回滚
+
+任务生成后，由 `spool_service/task_service/ebs_task_service.py` 的 `EbsTaskSet` 负责执行，继承自 `CommonTaskSet`：
+
+```python
+# ecs-service/spool_service/task_service/ebs_task_service.py — 真实源码
+class EbsTaskSet(CommonTaskSet):
+
+    @staticmethod
+    def mount_disk_success(ebs_task):
+        """挂载成功后：更新 disk 状态 + 更新订单"""
+        event_param = ebs_task.event.event_param
+        ecs_id = event_param['ecs_id']
+        disk_id = ebs_task.cloud_id
+        disk = CloudOsDisk.objects.get(disk_id=disk_id, is_valid=True)
+        # ... 状态更新 ...
+
+    def common_op_ebs_error(self, ebs_task):
+        """失败处理：回滚 disk 状态"""
+        disk_id = ebs_task.cloud_id
+        task_type = ebs_task.task_type
+        with transaction.atomic():
+            kwargs = {'update_time': datetime.datetime.now()}
+            if task_type == EbsEventType.MOUNT_DISK:
+                kwargs['ecs_id'] = ''                # 清空挂载的ECS
+                kwargs['status'] = DiskResourceStatus.WAITING    # 回滚为"待挂载"
+            elif task_type == EbsEventType.UNMOUNT_DISK:
+                kwargs['status'] = DiskResourceStatus.RUNNING    # 回滚为"使用中"
             else:
-                event.status = "completed"                # 全部成功
-                event.save()
-
-# 3. 云盘创建的子任务链
-def create_ebs_tasks(event):
-    return [
-        Task("call_compute_admin", "create_disk", params),  # 调虚拟化层创建
-        Task("poll_disk_status", disk_id),                   # 轮询直到 ready
-        Task("update_db_status", disk_id, "available"),      # 更新状态
-    ]
+                kwargs['status'] = DiskResourceStatus.ERROR      # 标记为错误
+            CloudOsDisk.objects.filter(disk_id=disk_id, is_valid=True).update(**kwargs)
 ```
-
-> **Spooler 和 Celery 的区别：** Spooler 是 uWSGI 自带的，不需要额外的 Worker 进程和服务（RabbitMQ）。缺点是没有任务优先级、没有可视化管理界面、任务失败重试需要自己写。
 
 **面试话术：**
 
-> "云盘操作是**异步非阻塞**的。用户创建云盘的请求进来，我们立即生成一个事件 ID 返回，不阻塞等待。Spool Consumer 持续轮询事件表，把大事件拆成子任务链——调虚拟化层、轮询状态、更新数据库——一步步执行。云盘模块我经手了 4 个子系统的完整生命周期：创建/挂载/卸载/扩容/销毁，以及磁盘库存管理和计费价格计算。"
+> "EBS 云盘模块我负责了完整的三层实现。gic-business 层是用户控制台后端——`EbsView` 用 DRF 的 `GenericViewSet` + `@action` 装饰器定义了 20+ 个端点，参数校验走 Serializer，业务逻辑在 `EbsOperateService` 里（先校验权限→再调 HTTP 客户端→返回结果）。HTTP 客户端 `EbsServiceRequest` 封装了 30+ 个下游 API，通过 `settings.EBS_SERVICE_URL` 配置目标地址。最底层 ecs-service 用 `DiskEventSet` 把每个操作拆成子任务链——比如挂载操作需要传 `instance_id`（目标 ECS）+ `attach_flag`（挂载/卸载标识）+ `order`（多盘挂载顺序）。任务框架支持自动失败回滚：挂载失败就把 `ecs_id` 清空、状态回滚到 `WAITING`。"
+
+
 
 ---
 
-## Q3: 云盘挂载和卸载的完整流程
+## Q3: 云盘挂载/卸载的完整流程与权限校验
 
 **场景理解：**
 
-用户在控制台把一块"可用"状态的云盘挂载到某台"运行中"的云主机上。这个操作涉及两层校验和多步异步执行：
+用户在控制台把一块云盘挂载到云主机。这个操作涉及 `gic-business` 层的权限校验 + `ecs-service` 层的事件拆分和异步执行。
 
-```
-1. gic-business: 校验权限（云盘和 ECS 属于同一用户吗？region 一致吗？）
-2. gic-business: 云盘状态必须是 "available"，ECS 必须是 "running"
-3. gic-business → ecs-service: POST mount_ebs
-4. ecs-service: 创建事件 → Spooler 异步执行
-5. ecs-service → ebs-service（下游微服务）: 调用挂载接口
-6. ebs-service → 虚拟化层: 实际执行磁盘挂载
-7. ecs-service: 轮询结果 → 更新云盘状态为 "in-use"
-```
+### 3.1 gic-business Backend 层：权限校验
 
-**关键校验逻辑：**
+真实源码在 `gic-business/apps/api/backend/ebs_service.py`，关键校验逻辑：
 
 ```python
-# gic-business/ebs_backend 中的挂载校验
-def mount_ebs(data):
-    # 1. 查云盘状态
-    disk = get_disk_info(data["disk_id"])
-    if disk["status"] != "available":
-        raise BusinessError("云盘状态不是可用", code="InvalidDiskStatus")
-    if disk["user_id"] != data["user_id"]:
-        raise BusinessError("无权操作此云盘", code="NotOwner")
+# gic-business/apps/api/backend/ebs_service.py — 真实源码
+class EbsOperateService(BasicService):
 
-    # 2. 查 ECS 状态
-    ecs = get_ecs_info(data["ecs_id"])
-    if ecs["status"] != "running":
-        raise BusinessError("云主机状态不是运行中", code="InvalidECSStatus")
-    if ecs["user_id"] != data["user_id"]:
-        raise BusinessError("无权操作此云主机", code="NotOwner")
+    def do_mount_disk(self, data):
+        ecs_id = data['ecs_id']
+        disk_ids = data['disk_ids']
+        host_id = data.get('host_id', '')
+        is_follow_delete = data.get('is_follow_delete', False)
 
-    # 3. 查 region 一致性（云盘和 ECS 必须在同一数据中心）
-    if disk["region"] != ecs["region"]:
-        raise BusinessError("云盘和云主机不在同一区域，无法挂载", code="RegionMismatch")
+        # === 权限校验（继承自 BasicService 的方法）===
+        if not host_id:
+            self.check_customer_ecs([ecs_id])          # ECS 是否属于当前用户
+        self.check_customer_disks(disk_ids)             # 云盘是否属于当前用户
+        self.check_disks_is_follow_delete(disk_ids, is_follow_delete)  # 随删属性校验
 
-    # 4. 通过后调 ecs-service 执行
-    resp = request_service.mount_ebs(data)
-    return resp
+        # === 组装参数传给 ecs-service ===
+        params = {
+            'customer_id': self.customer_id,
+            'ecs_id': ecs_id,
+            'disk_ids': disk_ids,
+            'is_follow_delete': is_follow_delete,
+            'op_user': self.op_user,
+            'op_source': self.op_source,
+            'host_id': host_id,
+            'product_source': data.get('product_source', '')
+        }
+        res_data = EbsServiceRequest.disk_mount_info(params)
+        return res_data
+```
+
+三层校验逻辑：
+- `check_customer_ecs()` — 查 `CloudOsEcs` 表确认这台 ECS 的 `customer_id` 匹配当前用户
+- `check_customer_disks()` — 查 `CloudOsDisk` 表确认这些云盘的 `customer_id` 匹配当前用户
+- `check_disks_is_follow_delete()` — 校验云盘是否设置了"随 ECS 删除"
+
+### 3.2 ecs-service 层：挂载事件拆分
+
+挂载操作在 `DiskEventSet.common_init_ebs_event()` 中的处理：
+
+```python
+# ecs-service — 真实源码
+if event_type == EbsEventType.MOUNT_DISK:  # 挂载云盘
+    ecs_id = event_param['ecs_id']
+    global_context['instance_id'] = ecs_id
+    global_context['volume_info'][0]['attach_flag'] = EbsAttachFlagType.ATTACH   # 挂载标记
+    global_context['volume_info'][0]['order'] = order     # 多盘挂载顺序
+    disk_type = disk.ecs_goods.feature
+    global_context['volume_info'][0]['disk_type'] = disk_type   # 磁盘类型(SSD/HDD)
+
+if event_type == EbsEventType.UNMOUNT_DISK:  # 卸载云盘
+    ecs_id = disk.ecs_id                                   # 从 disk 记录上取
+    global_context['instance_id'] = ecs_id
+    global_context['volume_info'][0]['attach_flag'] = EbsAttachFlagType.UNLOAD  # 卸载标记
+```
+
+### 3.3 失败自动回滚
+
+```python
+# ecs-service/spool_service/task_service/ebs_task_service.py — 真实源码
+def common_op_ebs_error(self, ebs_task):
+    """失败回滚磁盘状态"""
+    disk_id = ebs_task.cloud_id
+    task_type = ebs_task.task_type
+
+    with transaction.atomic():
+        kwargs = {'update_time': datetime.datetime.now()}
+
+        if task_type == EbsEventType.MOUNT_DISK:
+            kwargs['ecs_id'] = ''                           # 清空挂载关系
+            kwargs['status'] = DiskResourceStatus.WAITING   # → "待挂载"
+        elif task_type == EbsEventType.UNMOUNT_DISK:
+            kwargs['status'] = DiskResourceStatus.RUNNING   # → "使用中"
+        else:
+            kwargs['status'] = DiskResourceStatus.ERROR     # → "错误"
+
+        CloudOsDisk.objects.filter(disk_id=disk_id, is_valid=True).update(**kwargs)
 ```
 
 **面试话术：**
 
-> "挂载操作的核心是**状态校验**。云盘必须是 available 状态、ECS 必须是 running 状态、两者必须同 region 同用户。任何一个条件不满足都不能挂载。这个校验在 gic-business 层做，避免把无效请求打到 ecs-service 浪费资源。校验通过后，ecs-service 异步执行——调 ebs-service 微服务→虚拟化层→轮询→等状态变为 in-use。"
+> "挂载前的校验集中在 `BasicService` 的 check 方法族里——`check_customer_ecs` 验证 ECS 归属、`check_customer_disks` 验证云盘归属。校验通过后，gic-business 通过 `EbsServiceRequest.disk_mount_info()` 把请求发给 ecs-service。ecs-service 在 `DiskEventSet` 里根据事件类型 `MOUNT_DISK` 给 `volume_info` 打上 `attach_flag=ATTACH` 标记和 `order` 顺序。失败回滚由 `common_op_ebs_error` 统一处理——`with transaction.atomic()` 保护，挂载失败就清空 `ecs_id`，状态回滚到 `WAITING`。"
+
+
 
 ---
 
@@ -2522,11 +2698,163 @@ def expansion_ebs(data):
 
 **面试话术：**
 
-> "扩容有个特别的地方——**在线扩容**。云盘正在挂载状态时也能扩容，不需要先卸载。扩容成功后需要通知 ECS 端重新扫描磁盘，否则操作系统里看到的还是旧容量。价格也会跟着变——扩容本质是变更了配置规格，需要按新的容量重新计费。"
+> "云盘扩容有两类——容量扩容和性能调整。容量扩容改动 `volume_info[0]['size']`；IOPS/Mbps 性能调整走 `CHANGE_IOPS_MBPS` 事件，可以单独调 IOPS、带宽，或两者一起调。扩容都是在线操作，不需要先卸载。本地盘扩容和云盘扩容走不同的 task 类型（`UPDATE_DISK` vs `UPDATE_LOCAL_DISK`），因为本地盘直接挂在宿主机上。"
 
 ---
 
-## Q5: 云盘库存管理与计费
+## Q5: 云盘库存与运维管理
+
+**场景理解：**
+
+ecs-business 是运维管理台，负责物理机磁盘库存管理和云盘运维操作。运维人员可以查看每个物理机还有多少磁盘容量、管理存储池、调整 IOPS/Mbps。
+
+### 5.1 ecs-business 的 EbsView（运维视角，27 个端点）
+
+```python
+# ecs-business/apps/api/views/ebs.py — 真实源码（运维管理台）
+class EbsView(GenericViewSet):
+
+    # ===== 云盘 CRUD（运维侧）=====
+    @action(methods=['POST'], url_path='create_disk', ...)
+    def create_disk(self, req, data):
+        op = EbsOperateService(data['customer_id'], req.user.username, OpSource.CLOUD_OP)
+        res = op.api_create_ebs(data)
+        return res
+
+    @action(methods=['POST'], url_path='delete', ...)       # 逻辑删除
+    @action(methods=['POST'], url_path='destroy_disk', ...) # 物理销毁
+    @action(methods=['POST'], url_path='recover', ...)      # 恢复
+
+    # ===== 库存与容量管理 =====
+    @action(methods=['GET'], url_path='disk_info', ...)     # 云盘规格
+    @action(methods=['POST'], url_path='get_disk_limit', ...)    # 云盘余量
+    @action(methods=['GET'], url_path='get_pool_info', ...)      # 存储池售卖率
+    @action(methods=['POST'], url_path='handle_pool_info', ...)  # 设置售卖状态
+    @action(methods=['GET'], url_path='search_pool_add_rate', ...) # 30天售卖率
+
+    # ===== 性能调整 =====
+    @action(methods=['POST'], url_path='change_iops_mbps', ...)   # IOPS/Mbps调整
+    @action(methods=['POST'], url_path='iops_mbps_record', ...)   # 操作记录
+    @action(methods=['GET'], url_path='get_iops_mbps_limit', ...) # IOPS/Mbps限制
+```
+
+### 5.2 EbsServiceRequest 的下游调用（真实端点列表）
+
+```python
+# ecs-business/utils/request_service.py — 真实源码
+class EbsServiceRequest(BusinessRequest):
+    EBS_SERVICE_URL = settings.EBS_SERVICE_URL
+
+    # 向下游 ebs-service 发起的 HTTP 端点（部分）
+    DISK_MOUNT_URL       = '/ebs_service/v1/ebs/mount/'
+    DISK_UNMOUNT_URL     = '/ebs_service/v1/ebs/unmount/'
+    DISK_CREATE_URL      = '/ebs_service/v1/ebs/api_create_disk/'
+    DISK_UPDATE_URL      = '/ebs_service/v1/ebs/expansion/'
+    DISK_LIMIT_URL       = '/ebs_service/v1/ebs/get_disk_limit/'
+    EBS_PRICE_URL        = '/ebs_service/v1/ebs_data/get_ebs_price/'
+    DISK_LIST_URL        = '/ebs_service/v1/ebs_data/disk_list/'
+    EBS_QUOTA_URL        = '/ebs_service/v1/ebs_data/check_ebs_quota/'
+    SNAPSHOT_CREATE_URL  = '/ebs_service/v1/snapshot/api_create_snapshot/'
+    SNAPSHOT_PRICE_URL   = '/ebs_service/v1/snapshot_data/get_snapshot_price/'
+    # ... 30+ 个端点
+
+    # 所有请求走同一个基类方法
+    @classmethod
+    def req(cls, url, method, param):
+        res_data = cls.request(url, method, **param)
+        if res_data.get('code') == 'Success':
+            return res_data['data']
+        else:
+            raise BusinessException(res_data, extra_msg=res_data.get('message', ''))
+
+    @classmethod
+    def disk_mount_info(cls, param):   return cls.post(cls.DISK_MOUNT_URL, param)
+    @classmethod
+    def disk_create_ebs(cls, param):   return cls.post(cls.DISK_CREATE_URL, param)
+    @classmethod
+    def disk_expansion_info(cls, param): return cls.post(cls.DISK_UPDATE_URL, param)
+```
+
+**面试话术：**
+
+> "运维侧 EBS 比用户侧多了库存管理、存储池管控、IOPS/Mbps 调整等端点。`EbsServiceRequest` 封装了 30+ 个下游 HTTP 端点，所有请求走统一的 `req()` 基类方法——成功检查 `code == 'Success'` 后返回 `data`，失败抛 `BusinessException`。存储池管理包括查看 30 天售卖率、设置售卖阈值、禁售操作等。"
+
+---
+
+## Q6: EBS 操作失败回滚与最终一致性
+
+**场景理解：**
+
+云盘操作是异步的——任务生成后写入 `CloudOsTask` 表，Spooler 轮询执行。如果中间失败，必须正确回滚磁盘状态。
+
+### 6.1 失败回滚（真实源码）
+
+```python
+# ecs-service/spool_service/task_service/ebs_task_service.py — 真实源码
+class EbsTaskSet(CommonTaskSet):
+
+    def common_op_ebs_error(self, ebs_task):
+        disk_id = ebs_task.cloud_id
+        task_type = ebs_task.task_type
+        event = ebs_task.event
+        event_param = event.event_param
+
+        with transaction.atomic():
+            kwargs = {'update_time': datetime.datetime.now()}
+
+            # 挂载失败 → 清空ECS关联，状态→待挂载
+            if task_type == EbsEventType.MOUNT_DISK:
+                kwargs['ecs_id'] = ''
+                kwargs['status'] = DiskResourceStatus.WAITING
+
+            # 卸载失败 → 状态→使用中
+            elif task_type == EbsEventType.UNMOUNT_DISK:
+                kwargs['status'] = DiskResourceStatus.RUNNING
+
+            # 其他操作失败 → 状态→错误
+            else:
+                kwargs['status'] = DiskResourceStatus.ERROR
+
+            CloudOsDisk.objects.filter(disk_id=disk_id, is_valid=True).update(**kwargs)
+
+            # 检查是否需要回收处理
+            CommonTaskSet.check_recycling(disk_id, ebs_task.task_param, CallBackTaskStatus.FAILED)
+
+            # 回调ECS状态
+            if event_param.get('ecs_disk_dict', {}):
+                EbsTaskSet.callback_ecs_status(ebs_task)
+```
+
+### 6.2 事件→任务链
+
+```python
+# ecs-service/spool_service/event_service/ebs_event_service.py
+# 删除云盘时连带删除关联快照
+if event_type == EbsEventType.DELETE_DISK:
+    if is_delete_not_infinite:
+        # 找出关联的非无限快照，为每个快照生成删除任务
+        snapshot_objs = CloudOsSnapshot.objects.filter(disk_id=disk.disk_id, is_valid=1, is_infinite=False)
+        for snapshot in snapshot_objs:
+            snapshot_task = cls.create_delete_snapshot_task(
+                snapshot, region_id, az_code, customer_id, az_id, now, event)
+            ebs_task_list.append(snapshot_task)
+
+# 销毁云盘时：force 标记 + 删除所有快照
+if event_type == EbsEventType.DESTROY_DISK:
+    global_context['force'] = 1
+    snapshot_objs = CloudOsSnapshot.objects.filter(disk_id__in=disk.disk_id, is_valid=1)
+    for snapshot in snapshot_objs:
+        snapshot_task = cls.create_delete_snapshot_task(...)
+        ebs_task_list.append(snapshot_task)
+```
+
+**面试话术：**
+
+> "一致性保证有两层。一是**事务保护**——`with transaction.atomic()` 包裹状态回滚，失败时磁盘状态恢复为操作前的值（挂载失败清 `ecs_id`，卸载失败恢复为 `RUNNING`）。二是**关联资源清理**——删除云盘时连带删除关联的快照链。每个快照生成独立的子任务，和主任务一起写入任务列表，保证云资源的级别一致。"
+
+---
+
+## Q7: URL Rewrite 中间件——多云盘供应商路由
 
 **场景理解：**
 
@@ -2620,37 +2948,300 @@ class EventHandler:
 
 ---
 
-## Q7: URL Rewrite 中间件——多云盘的供应商路由
+## Q7: URL Rewrite 中间件——多云盘供应商路由
 
 **场景理解：**
 
-首都在线有自己的数据中心（CDS 自有云），也对接了火山引擎（VolcEngine）等第三方云。用户创建云盘时，gic-business 根据 region 自动判断走自有云还是第三方云。
+gic-business 有两套 API：`apps/api/views/ebs.py`（单云 CDS）和 `apps/multi_api/views/multi_ebs.py`（多云）。中间件根据 region 自动 URL 重写，对前端透明。
+
+### 7.1 中间件 + 多套 API 架构
+
+```
+用户请求 /gic_business/v1/ebs/create_disk/
+    ↓ URLRewriteMiddleware
+    │ region 在 MULTI_CLOUD_REGIONS?
+    │ YES → 重写为 /multi_gic_business/v1/ebs/create_disk/
+    │       路由到 apps/multi_api/views/multi_ebs.py
+    │ NO  → 保持原 URL
+    │       路由到 apps/api/views/ebs.py
+```
+
+### 7.2 gic-business 的三套 API 体系
 
 ```python
-# gic-business 的 URL Rewrite 中间件
-class URLRewriteMiddleware:
-    """
-    请求:  /gic_business/v1/ebs/create_ebs/
-    如果 region 在 multi_cloud_regions 中:
-      重写为 /multi_gic_business/v1/ebs/create_ebs/
-      并路由到 apps/multi_api/views/multi_ebs.py
-    """
+# gic-business 同时维护三套 EBS API：
 
-    def process_request(self, request):
-        region = request.META.get("HTTP_REGION") or request.data.get("region")
+# 1. 单云 API — apps/api/views/ebs.py（EbsView, 35+ 端点）
+# 2. 多云 API — apps/multi_api/views/ （multi_ebs.py 等，调用第三方云 SDK）
+# 3. OpenAPI — apps/api/views/ebs_open_api.py（对外标准API, action分发）
+# 4. Internal API — apps/api/views/ebs_internal_api.py（内部产品调用）
+```
 
-        if region in MULTI_CLOUD_REGIONS:
-            # 重写 URL 到多云路径
-            request.path_info = request.path_info.replace(
-                "gic_business/v1/", "multi_gic_business/v1/"
-            )
-            # 设置供应商标识（供后续 Backend 层使用）
-            request.cloud_provider = REGION_PROVIDER_MAP[region]
+### 7.3 代码图谱中的依赖关系
+
+从 `cloud-os-ecs-business-代码图谱.md` 可以看到：
+
+```mermaid
+EbsView → EbsOperateService → EbsServiceRequest → cos-ebs-service (下游)
+                                                      ├── mount
+                                                      ├── unmount
+                                                      ├── create_disk
+                                                      ├── expansion
+                                                      └── disk_list
+```
+
+`EbsServiceRequest` 的 `EBS_SERVICE_URL` 在 settings 中配置，通过修改配置可以指向不同的下游服务。
+
+**面试话术：**
+
+> "gic-business 同时维护三套 EBS API——单云 CDS 的 `apps/api/views/ebs.py`（35+ 端点）、多云的 `apps/multi_api/views/`（调用第三方云 SDK）、OpenAPI 网关的 `ebs_open_api.py`（action 分发）。URL Rewrite 中间件在请求到达 View 层之前根据 region 决定路由到哪套 API。`EbsServiceRequest` 封装了 30+ 个下游端点，所有请求走统一的 `req()` 基类——成功检查 `code == 'Success'`，失败抛 `BusinessException`。"
+
+---
+
+---
+
+## Q8: uWSGI Spooler 异步任务引擎是怎么工作的？
+
+**场景理解：**
+
+创建云主机、挂载云盘这些操作从几秒到几分钟不等，不能阻塞 HTTP 请求。Celery 需要额外的 RabbitMQ + Worker 进程，运维成本高。团队选了 uWSGI Spooler——uWSGI 自带的异步任务机制，零额外依赖。
+
+**核心流程：**
+
+```
+HTTP请求 → View → 写入CloudOsEvent → 返回event_id
+                                          ↓
+                              Spool Consumer (轮询)
+                                          ↓
+                              拆分子任务 → CloudOsTask
+                                          ↓
+                              调虚拟化层 compute-admin
+                                          ↓
+                              轮询结果 → 更新状态 → 回调计费
+```
+
+**真实代码：**
+
+```python
+# ecs-service/spool_service/event_service/ebs_event_service.py
+class DiskEventSet(object):
+
+    @classmethod
+    def common_init_ebs_event(cls, event):
+        """把一个大事件拆成多个子任务，每个资源一个task"""
+        event_type = event.event_type
+        maintask_name = EVENT_MAIN_TASK_DICT[event_type]  # 事件→主任务名映射
+        disk_ids = event_param['disk_ids']
+
+        for disk in disk_queryset:
+            # 为每个云盘单独创建 task
+            task_param = gen_task_param(maintask_name, ResourceType.EBS, resource_id,
+                                        region_id, az_code, customer_id, global_context)
+            task_id = create_uuid()
+            ebs_task = gen_task_instance(task_id, resource_id, az_id, customer_id,
+                                         now, event, event_type, task_param, EcsCloudType.EBS)
+            ebs_task_list.append(ebs_task)
+
+        # 批量写入 CloudOsTask 表
+        CloudOsTask.objects.bulk_create(ebs_task_list)
+```
+
+任务执行成功后，`EbsTaskSet` 负责更新状态 + 回调计费：
+
+```python
+# ecs-service/spool_service/task_service/ebs_task_service.py
+class EbsTaskSet(CommonTaskSet):
+
+    @staticmethod
+    def mount_disk_success(ebs_task):
+        """挂载成功后更新状态"""
+        disk_id = ebs_task.cloud_id
+        disk = CloudOsDisk.objects.get(disk_id=disk_id, is_valid=True)
+        # ... 更新 disk 状态 ...
+
+    def common_op_ebs_error(self, ebs_task):
+        """任何操作失败后的事务回滚"""
+        with transaction.atomic():
+            CloudOsDisk.objects.filter(...).update(**kwargs)
 ```
 
 **面试话术：**
 
-> "多供应商路由是通过 URL Rewrite 中间件实现的——在请求到达 View 层之前，中间件检查 region 参数，如果属于多云供应商，就把 URL 从单云路径重写到多云路径。整个过程对前端透明——用户调同一个 API，后台自动判断走自有云还是火山引擎。"
+> "我们没用 Celery，用的是 uWSGI 自带的 Spooler。好处是零额外组件——不需要 RabbitMQ、不需要单独 Worker 进程。Spool Consumer 轮询 `CloudOsEvent` 表，发现 pending 事件就拆成子任务写入 `CloudOsTask` 表。每个云盘资源一个 task，批量创建用 `bulk_create`。任务执行后 `EbsTaskSet` 负责成功回调和失败回滚。选 Spooler 是实用主义的选择——云资源操作本身就是异步的，不需要 Celery 那么重的任务调度。"
+
+---
+
+## Q9: OpenAPI 网关——action 分发模式
+
+**场景理解：**
+
+首都在线对外暴露标准 API 给客户（类似于 AWS API），客户通过一个统一的入口 URL，用 `Action` 参数指定想要的操作。
+
+gic-business 的 `apps/api/views/ebs_open_api.py` 负责 EBS 相关的 OpenAPI 网关。
+
+**面试话术：**
+
+> "OpenAPI 网关的核心是**action 分发模式**。所有外部 API 请求打到同一个 URL，通过请求参数中的 `Action` 字段路由到对应处理函数。gic-business 的 OpenAPI 覆盖了 ECS、EBS、快照、镜像四大领域，30+ 种 action。网关层做了统一的签名验证——防止请求被篡改和重放。和 AWS API 的设计理念一致：客户用 `CreateDisk` 而不是 `POST /api/v1/disks`。"
+
+---
+
+## Q10: 超大模块管理——单文件 571KB 的 ecs_service.py
+
+**场景理解：**
+
+ecs-service 的核心文件 `ecs_service.py` 有 **571KB**，是整个项目最庞大的文件，包含了 ECS 创建/删除/启停/迁移/驱散等全部逻辑。
+
+**面试话术：**
+
+> "571KB 的单文件是历史遗留问题——项目初期为了快速交付，所有 ECS 逻辑写在一个 backend 文件里。虽然不符合'小而美'的设计原则，但在当时的场景下有它的合理性：ECS 的操作之间高度耦合，拆文件会导致循环引用。我的态度是——不追求完美架构，追求可交付。如果团队决定重构，我的方案是按操作域拆：create_ecs.py、migrate_ecs.py、power_ecs.py，每个 100-200KB，接口不变。"
+
+---
+
+## Q11: 多数据库路由——4 个 MySQL 如何管理？
+
+**场景理解：**
+
+三个服务共享 4 个 MySQL 数据库：
+
+| 数据库 | 用途 |
+|------|------|
+| cloud_os | 核心业务数据（ECS、云盘、主机、事件、任务） |
+| cdscp | 客户配置数据（用户、计费） |
+| ucenter | 用户中心（SSO 认证 token） |
+| nas | NAS 存储相关 |
+
+**Django 多数据库配置：**
+
+```python
+# settings.py
+DATABASES = {
+    'default': {  # cloud_os 是默认库
+        'ENGINE': 'django.db.backends.mysql',
+        'NAME': 'cloud_os',
+    },
+    'cdscp': {
+        'NAME': 'cdscp',
+    },
+    'ucenter': {
+        'NAME': 'ucenter',
+    },
+    'nas': {
+        'NAME': 'nas',
+    },
+}
+
+# ORM 使用 —— 每个 Model 的 Meta 指定数据库
+class CloudOsDisk(models.Model):
+    class Meta:
+        app_label = 'cloud_os'
+        db_table = 'cloud_os_disk'
+
+class CustomerUser(models.Model):
+    class Meta:
+        app_label = 'cdscp'
+        db_table = 'cdscp_customer_user'
+
+# 跨库查询时手动指定 using
+users = CustomerUser.objects.using('cdscp').filter(is_valid=True)
+```
+
+**面试话术：**
+
+> "4 个库是历史演进的结果——cloud_os 是业务核心库，cdscp 和 ucenter 是公司级共享服务（客户数据、SSO），nas 是存储域专属。Django 多数据库通过 Model 的 `Meta.app_label` + `using()` 方法路由。跨库 JOIN 在 Django ORM 中不可行——如果业务需要跨库关联，只能在应用层做两次查询后在 Python 里 join。"
+
+---
+
+## Q12: Kafka 状态同步
+
+**场景理解：**
+
+虚拟化层（compute-admin）的物理机和虚拟机状态变更后，通过 Kafka 上报。ecs-service 启动 Kafka Consumer，消费消息后更新 MySQL 中的对应记录。
+
+**面试话术：**
+
+> "Kafka 在我们的架构里做**异步状态同步**。虚拟化层是状态的真实来源——主机宕机、ECS 异常重启，都由 compute-admin 通过 Kafka 上报。ecs-service 作为唯一能写状态的消费方，保证状态的单点一致性。Kafka Consumer 是独立进程，随 uWSGI 一起启动。消息按 topic 分区，每个 partition 一个 consumer 线程，保证同 partition 内消息的顺序处理。"
+
+---
+
+## Q13: Redis 的使用场景
+
+**场景理解：**
+
+三个服务共享 Redis Cluster，主要三个用途——缓存热点数据、分布式锁、Session 管理。
+
+**面试话术：**
+
+> "Redis 在我们的架构里主要三个角色：**分布式锁**用于防止并发操作同一资源——比如同一台物理机不能同时被两个运维人员设为维护模式；**热点缓存**存用户信息和机房配置，减少 MySQL 查询；**Session 管理**存 SSO 登录状态。Redis 是集群模式，通过 Django 的 `django-redis` 集成，支持 failover。"
+
+---
+
+## Q14: 审计日志的设计
+
+**场景理解：**
+
+ecs-business 负责运维审计——每一项运维操作（主机上线/下架/维护，云盘批量删除等）都记录到 `CloudOsOperationList` 表。
+
+```python
+# ecs-business/apps/api/backend/ebs_service.py — 真实源码
+def set_operation(self, disk_ids, content, status, operation_type=OperationType.CHANGE, under_msg={}, fail_reason=''):
+    """批量记录运维操作日志"""
+    operation_list = []
+    disk_objs = CloudOsDisk.objects.select_related('az').filter(
+        disk_id__in=disk_ids).values('disk_id', 'name', 'az__az_id')
+
+    for disk in disk_objs:
+        operation_list.append(CloudOsOperationList(
+            operation_id=create_uuid(),
+            cloud_type=LogType.DISK,
+            cloud_id=disk['disk_id'],
+            content=content,                          # 操作内容
+            response=fail_reason + under_msg[disk_id] if under_msg else fail_reason,
+            status=status,                             # 成功/失败
+            op_user=self.op_user,                      # 操作人
+            operation_type=operation_type,             # 操作类型
+            cloud_name=disk['name'],
+            az_id=disk['az__az_id']
+        ))
+
+    CloudOsOperationList.objects.bulk_create(operation_list)
+```
+
+**面试话术：**
+
+> "审计日志的核心是**不可删除**和**完整记录**。`CloudOsOperationList` 表只有 INSERT 没有 UPDATE/DELETE。每个操作记录包含操作人(`op_user`)、操作内容、操作结果、失败原因。`bulk_create` 批量写入提高性能。审计日志还要关联到具体云资源——方便排查'这块云盘什么时候被谁删了'。运维侧所有危险操作（批量删除、物理销毁）都强制记录。"
+
+---
+
+## Q15: SSO 认证 + 权限校验
+
+**场景理解：**
+
+三个服务共用同一套 SSO Token 验证。gic-business 和 ecs-business（面向用户/运维）需要认证，ecs-service（纯内部调用）不需要。
+
+```python
+# ecs-business/apps/api/views/ebs.py — 真实源码
+class EbsView(GenericViewSet):
+
+    @login_required    # ← SSO 登录验证
+    @response
+    def mount(self, req, data):
+        op = EbsOperateService(
+            data['customer_id'],     # 从请求参数获取客户ID
+            req.user.username,        # 从 SSO token 获取操作用户名
+        )
+        res = op.api_mount_ebs(data)
+        return res
+
+# @login_required 装饰器做了什么：
+# 1. 从 Header 提取 SSO token
+# 2. 调 ucenter 服务验证 token 有效性
+# 3. 将 user 对象绑定到 req.user
+# 4. token 无效 → 401
+```
+
+**面试话术：**
+
+> "三个服务的认证策略不同：gic-business 和 ecs-business 用 `@login_required` 装饰器 + SSO Token，ecs-service 是纯内部调用不做认证。`customer_id` 从请求参数传入——保证了'用户只能操作自己的资源'（Backend 层的 `check_customer_ecs`、`check_customer_disks` 基于 customer_id 校验）。运维侧用 `OpSource.CLOUD_OP` 标识区分管理员操作。"
 
 ---
 
