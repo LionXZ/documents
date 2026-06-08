@@ -2254,3 +2254,404 @@ def schedule_full_backups():
 ---
 
 > **面试策略建议**：每道题先从"场景理解"入手 → 说设计思路 → 再给关键代码 → 最后补充边界情况。技术负责人很看重**从场景到方案的完整思维链路**。
+
+---
+
+# 十二、首都在线 CloudOS 云管理平台
+
+> 项目背景：首都在线（CapitalOnline）CloudOS 公有云管理平台，Python Django + DRF 微服务架构。三个核心服务分工协作——ecs-service（执行层）、ecs-business（运维层）、gic-business（用户控制台层），共享 MySQL / Redis / Kafka 基础设施。
+
+---
+
+## Q1: 介绍 CloudOS 三个服务的分层架构
+
+**场景理解：**
+
+首都在线是一个公有云平台（对标阿里云/腾讯云）。终端用户在网页上买云主机、挂云盘，背后是三层微服务：
+
+```
+用户浏览器 → gic-business → ecs-service → 虚拟化层
+运维管理台 → ecs-business → ecs-service → 虚拟化层
+```
+
+- **gic-business（用户控制台）**：给终端用户用的，管自己的云主机/云盘/镜像/快照
+- **ecs-business（运维管理台）**：给内部运维用的，管物理机/Pod/集群/库存
+- **ecs-service（核心执行层）**：真正执行云资源操作的服务，对接虚拟化层
+
+**设计思路：**
+
+三层分工人为做了"读写分离"——gic-business 和 ecs-business 只能读和发起请求，所有写的操作最终都在 ecs-service 里执行。这样保证了：
+
+1. 状态一致性——云资源状态变更只在一个地方发生
+2. 审计可追踪——所有变更操作统一经过 ecs-service
+3. 解耦——用户层改需求不影响运维层，运维层加功能不干扰用户层
+
+**面试话术：**
+
+> "我们当时是 Django + DRF 微服务架构，三个服务通过 HTTP 内部调用串联。最底层 ecs-service 是唯一能碰虚拟化的服务，上面两层是它的'客户端'。gic-business 面向终端用户，ecs-business 面向运维。最大的设计决策是**把执行和展示彻底分开**——业务层只做校验和编排，真正执行全在 service 层，保证了状态一致性。"
+
+---
+
+## Q2: EBS 云盘模块——从用户点击到云盘挂载全链路
+
+> 这是我主要负责的核心模块。EBS（Elastic Block Storage）是云盘——用户可以创建一块云盘，然后挂载到自己的云主机上。
+
+**场景理解：**
+
+用户登录 GIC 控制台 → 点击"创建云盘" → 选大小/类型/计费方式 → 确认。后端要做的事：
+
+```
+前端请求
+  → gic-business: 参数校验 + 价格计算 + 鉴权
+  → ebs-service: 调用 ebs-service 底层执行创建
+  → ecs-service: 事件→子任务→虚拟化层→轮询完成
+  → 状态更新
+```
+
+### 2.1 gic-business 层：EbsView + OpenAPI 网关
+
+用户控制台的 API 在 `gic-business/apps/api/views/ebs.py`（22 个端点）和 `multi_ebs.py`（20 个多云端点）。
+
+```python
+# gic-business 的 EbsView 核心端点
+class EbsView:
+    # 云盘 CRUD
+    def create_ebs():     # POST /gic_business/v1/ebs/create_ebs/
+    def destroy_ebs():    # DELETE 删除云盘
+    def expansion_ebs():  # PUT 扩容
+
+    # 挂载与卸载
+    def mount_ebs():      # POST 挂载到 ECS
+    def unmount_ebs():    # POST 从 ECS 卸载
+
+    # 查询
+    def get_ebs_list():   # GET 云盘列表
+    def get_ebs_detail(): # GET 云盘详情
+    def get_ebs_price():  # GET 价格查询（按容量/类型/计费方式）
+```
+
+每个 View 方法的流程都是一样的：
+
+```python
+def create_ebs(self, request):
+    # 1. Serializer 参数校验（大小/类型/计费方式/region）
+    serializer = CreateEbsSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    # 2. 调用 Backend 层做业务逻辑（价格计算、库存检查）
+    result = ebs_backend.create_ebs(serializer.validated_data)
+
+    # 3. 返回给前端
+    return Response(result)
+```
+
+> **要点：View 层只做三件事——校验参数、调 Backend、返回结果。业务逻辑全部在 Backend 层。**
+
+### 2.2 OpenAPI 网关——对外暴露标准 API
+
+gic-business 的另一个独特设计是 OpenAPI 网关。外部系统（比如客户自己的脚本）通过**统一的 action 参数**调用我们的云平台：
+
+```python
+# 客户请求
+POST /v1/
+{
+    "Action": "CreateDisk",      # ← 通过 action 分发
+    "DiskName": "my-disk",
+    "DiskSize": 100,
+    "DiskType": "SSD"
+}
+
+# 网关分发
+class OpenApiEbsViews:
+    ACTION_MAP = {
+        "CreateDisk":      "create_disk",
+        "AttachDisk":      "mount_disk",       # 挂载
+        "DetachDisk":      "unmount_disk",      # 卸载
+        "ResizeDisk":      "expansion_disk",    # 扩容
+        "DeleteDisk":      "destroy_disk",      # 删除
+        "DescribeDisks":   "get_disk_list",     # 查询
+    }
+```
+
+**面试话术：**
+
+> "OpenAPI 网关的设计思路是**action 分发模式**——用一个入口承接所有外部 API 请求，通过 `Action` 参数路由到对应的处理方法。这样做的好处是：对外接口简洁，一个 URL 搞定所有；对内增加了安全层，在网关统一做签名验证和频率限制。gic-business 有 30+ 种 action，覆盖了 ECS、EBS、快照、镜像等所有资源。"
+
+### 2.3 ecs-service 层：异步执行云盘操作
+
+云盘创建/挂载/扩容这些不是瞬间完成的（需要几秒到几十秒），必须异步执行。ecs-service 用 **uWSGI Spooler** 做异步任务引擎：
+
+```python
+# 简化后的 Spooler 事件处理流程
+
+# 1. View 层接收请求 → 创建事件记录
+def create_ebs(request):
+    event = CloudOsEvent.objects.create(
+        event_type="create_ebs",
+        status="pending",
+        params=request.data,    # 用户参数（大小、类型等）
+    )
+    return {"event_id": event.id, "status": "processing"}
+    # ⚠ 注意：这里立即返回，不阻塞等待创建完成
+
+# 2. Spool Consumer 轮询事件表
+def spool_consumer():
+    while True:
+        events = CloudOsEvent.objects.filter(status="pending")
+        for event in events:
+            event.status = "processing"
+            event.save()
+
+            # 3. 拆分子任务（按事件类型路由到不同处理器）
+            handler = get_event_handler(event.event_type)
+            subtasks = handler.generate_tasks(event)      # 生成子任务列表
+
+            # 4. 依次执行子任务
+            for task in subtasks:
+                result = task.execute()                   # 调用虚拟化层
+                if not result.success:
+                    retry_or_fail(task)
+                    break
+            else:
+                event.status = "completed"                # 全部成功
+                event.save()
+
+# 3. 云盘创建的子任务链
+def create_ebs_tasks(event):
+    return [
+        Task("call_compute_admin", "create_disk", params),  # 调虚拟化层创建
+        Task("poll_disk_status", disk_id),                   # 轮询直到 ready
+        Task("update_db_status", disk_id, "available"),      # 更新状态
+    ]
+```
+
+> **Spooler 和 Celery 的区别：** Spooler 是 uWSGI 自带的，不需要额外的 Worker 进程和服务（RabbitMQ）。缺点是没有任务优先级、没有可视化管理界面、任务失败重试需要自己写。
+
+**面试话术：**
+
+> "云盘操作是**异步非阻塞**的。用户创建云盘的请求进来，我们立即生成一个事件 ID 返回，不阻塞等待。Spool Consumer 持续轮询事件表，把大事件拆成子任务链——调虚拟化层、轮询状态、更新数据库——一步步执行。云盘模块我经手了 4 个子系统的完整生命周期：创建/挂载/卸载/扩容/销毁，以及磁盘库存管理和计费价格计算。"
+
+---
+
+## Q3: 云盘挂载和卸载的完整流程
+
+**场景理解：**
+
+用户在控制台把一块"可用"状态的云盘挂载到某台"运行中"的云主机上。这个操作涉及两层校验和多步异步执行：
+
+```
+1. gic-business: 校验权限（云盘和 ECS 属于同一用户吗？region 一致吗？）
+2. gic-business: 云盘状态必须是 "available"，ECS 必须是 "running"
+3. gic-business → ecs-service: POST mount_ebs
+4. ecs-service: 创建事件 → Spooler 异步执行
+5. ecs-service → ebs-service（下游微服务）: 调用挂载接口
+6. ebs-service → 虚拟化层: 实际执行磁盘挂载
+7. ecs-service: 轮询结果 → 更新云盘状态为 "in-use"
+```
+
+**关键校验逻辑：**
+
+```python
+# gic-business/ebs_backend 中的挂载校验
+def mount_ebs(data):
+    # 1. 查云盘状态
+    disk = get_disk_info(data["disk_id"])
+    if disk["status"] != "available":
+        raise BusinessError("云盘状态不是可用", code="InvalidDiskStatus")
+    if disk["user_id"] != data["user_id"]:
+        raise BusinessError("无权操作此云盘", code="NotOwner")
+
+    # 2. 查 ECS 状态
+    ecs = get_ecs_info(data["ecs_id"])
+    if ecs["status"] != "running":
+        raise BusinessError("云主机状态不是运行中", code="InvalidECSStatus")
+    if ecs["user_id"] != data["user_id"]:
+        raise BusinessError("无权操作此云主机", code="NotOwner")
+
+    # 3. 查 region 一致性（云盘和 ECS 必须在同一数据中心）
+    if disk["region"] != ecs["region"]:
+        raise BusinessError("云盘和云主机不在同一区域，无法挂载", code="RegionMismatch")
+
+    # 4. 通过后调 ecs-service 执行
+    resp = request_service.mount_ebs(data)
+    return resp
+```
+
+**面试话术：**
+
+> "挂载操作的核心是**状态校验**。云盘必须是 available 状态、ECS 必须是 running 状态、两者必须同 region 同用户。任何一个条件不满足都不能挂载。这个校验在 gic-business 层做，避免把无效请求打到 ecs-service 浪费资源。校验通过后，ecs-service 异步执行——调 ebs-service 微服务→虚拟化层→轮询→等状态变为 in-use。"
+
+---
+
+## Q4: 云盘扩容的特殊处理
+
+**场景理解：**
+
+云盘扩容和创建/挂载不同——扩容可以在线进行（云盘正挂载着也能扩容，不需要先卸载）。但扩容后需要通知 ECS 重新识别磁盘大小。
+
+```python
+# 扩容流程
+def expansion_ebs(data):
+    # 1. 校验
+    disk = get_disk_info(data["disk_id"])
+    if disk["status"] not in ["available", "in-use"]:
+        raise BusinessError("当前云盘状态不可扩容")
+
+    new_size = data["new_size"]
+    if new_size <= disk["storage_space"]:
+        raise BusinessError("新容量必须大于当前容量")
+
+    # 2. 价格计算（扩容只是变更了容量，按新的配置重新计费）
+    price = calculate_price(
+        disk_type=disk["disk_feature"],
+        new_size=new_size,
+        region=disk["region"]
+    )
+
+    # 3. 异步执行扩容
+    event = create_expansion_event(disk, new_size)
+
+    # 4. 如果云盘正在挂载中，扩容完成后通知 ECS 重新扫描磁盘
+    if disk["status"] == "in-use":
+        ecs_id = disk["attached_to"]
+        # 扩容完成后，ECS 需要 re-scan 磁盘才能识别新大小
+        add_post_hook(event, "notify_ecs_rescan", ecs_id)
+
+    return {"event_id": event.id, "price": price}
+```
+
+**面试话术：**
+
+> "扩容有个特别的地方——**在线扩容**。云盘正在挂载状态时也能扩容，不需要先卸载。扩容成功后需要通知 ECS 端重新扫描磁盘，否则操作系统里看到的还是旧容量。价格也会跟着变——扩容本质是变更了配置规格，需要按新的容量重新计费。"
+
+---
+
+## Q5: 云盘库存管理与计费
+
+**场景理解：**
+
+ecs-business 负责物理机磁盘库存的管理和维护。运维人员可以查看每个物理机还有多少磁盘空间可以分配给云盘。
+
+```python
+# ecs-business/ebs_service.py（运维视角）
+class EbsOperateService:
+    def get_disk_inventory(self, host_id):
+        """查某个物理机的磁盘库存"""
+        # 1. 调虚拟化层获取物理磁盘总容量和已用量
+        host_info = compute_admin.get_host_disk(host_id)
+
+        # 2. 调 ebs-service 获取该物理机上已分配的云盘列表
+        allocated_disks = ebs_request.get_disk_list(host_id=host_id)
+
+        # 3. 计算可用容量
+        total = host_info["total_capacity"]
+        used = sum(d["storage_space"] for d in allocated_disks)
+        available = total - used
+
+        return {
+            "host_id": host_id,
+            "total": total,
+            "used": used,
+            "available": available,
+            "disk_count": len(allocated_disks),
+        }
+
+    def get_ebs_price(self, data):
+        """云盘价格查询——按磁盘类型、容量、计费方式"""
+        # 磁盘类型: SSD(1) / SATA(0)
+        # 计费方式: 按量付费(0) / 包年包月(1)
+        order_data = {
+            "goods_id": data["ebs_goods_id"],      # 商品的 SKU ID
+            "disk_feature": data["disk_feature"],   # SSD/HDD
+            "storage_space": data["storage_space"], # 容量
+            "billing_method": data["billing_method"],
+            "region": data["region"],
+        }
+        return order_service.calculate_price(order_data)
+```
+
+**面试话术：**
+
+> "库存管理是运维视角的核心功能。运维人员需要知道每个物理机上还有多少磁盘容量可分配。库存统计需要调两个数据源——虚拟化层查物理磁盘总量，ebs-service 查已分配的云盘列表，差额就是可用容量。价格计算走 order-service 微服务，按照磁盘类型（SSD/HDD）、容量大小、计费方式三个维度定价。"
+
+---
+
+## Q6: 如何保证云盘操作的最终一致性
+
+**场景理解：**
+
+用户创建云盘 → Spooler 异步执行 → 中间可能失败（虚拟化层超时、网络抖动）。怎么保证用户看到的云盘状态是准确的？
+
+**设计思路：**
+
+```
+1. 事件表（CloudOsEvent）记录所有操作
+2. 每个事件 → 拆成多个子任务
+3. 子任务可重试（不在界面上显示失败，后台重试 3 次）
+4. 全部子任务成功 → 事件状态 = completed
+5. 任一子任务最终失败 → 事件状态 = failed, 云盘状态回滚为 error
+```
+
+```python
+# 最终一致性保证
+class EventHandler:
+    MAX_RETRY = 3
+
+    def execute_task(self, task):
+        for attempt in range(1, self.MAX_RETRY + 1):
+            try:
+                result = task.execute()
+                if result.success:
+                    return result
+            except Exception as e:
+                if attempt == self.MAX_RETRY:
+                    # 最终失败：回滚云盘状态
+                    disk = Disk.objects.get(id=task.disk_id)
+                    disk.status = "error"
+                    disk.status_message = f"操作失败(已重试{self.MAX_RETRY}次): {e}"
+                    disk.save()
+                    raise
+                time.sleep(2 ** attempt)  # 指数退避
+```
+
+**面试话术：**
+
+> "云盘是用户的核心资产，状态必须可靠。我们通过事件表 + 子任务重试来保证最终一致性——每个操作都记录在事件表里，子任务失败后指数退避重试 3 次。如果还是失败，云盘状态标记为 error，用户可以在控制台看到'操作失败'并重新发起。关键是**状态对用户透明**——是 processing 就是 processing，是 error 就是 error，不会出现'在后台卡住了用户不知道'的情况。"
+
+---
+
+## Q7: URL Rewrite 中间件——多云盘的供应商路由
+
+**场景理解：**
+
+首都在线有自己的数据中心（CDS 自有云），也对接了火山引擎（VolcEngine）等第三方云。用户创建云盘时，gic-business 根据 region 自动判断走自有云还是第三方云。
+
+```python
+# gic-business 的 URL Rewrite 中间件
+class URLRewriteMiddleware:
+    """
+    请求:  /gic_business/v1/ebs/create_ebs/
+    如果 region 在 multi_cloud_regions 中:
+      重写为 /multi_gic_business/v1/ebs/create_ebs/
+      并路由到 apps/multi_api/views/multi_ebs.py
+    """
+
+    def process_request(self, request):
+        region = request.META.get("HTTP_REGION") or request.data.get("region")
+
+        if region in MULTI_CLOUD_REGIONS:
+            # 重写 URL 到多云路径
+            request.path_info = request.path_info.replace(
+                "gic_business/v1/", "multi_gic_business/v1/"
+            )
+            # 设置供应商标识（供后续 Backend 层使用）
+            request.cloud_provider = REGION_PROVIDER_MAP[region]
+```
+
+**面试话术：**
+
+> "多供应商路由是通过 URL Rewrite 中间件实现的——在请求到达 View 层之前，中间件检查 region 参数，如果属于多云供应商，就把 URL 从单云路径重写到多云路径。整个过程对前端透明——用户调同一个 API，后台自动判断走自有云还是火山引擎。"
+
+---
+
+> 持续更新中 | 最后更新 2026-06-08
