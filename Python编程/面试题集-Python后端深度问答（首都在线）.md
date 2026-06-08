@@ -3020,54 +3020,116 @@ HTTP请求 → View → 写入CloudOsEvent → 返回event_id
                               轮询结果 → 更新状态 → 回调计费
 ```
 
-**真实代码：**
+**真实源码：**
 
 ```python
-# ecs-service/spool_service/event_service/ebs_event_service.py
-class DiskEventSet(object):
+# ecs-service/spool_service/spool_consumer.py — 真实源码
+# 核心入口：uWSGI @spool 装饰器 → EventCenter.event_route()
 
-    @classmethod
-    def common_init_ebs_event(cls, event):
-        """把一个大事件拆成多个子任务，每个资源一个task"""
-        event_type = event.event_type
-        maintask_name = EVENT_MAIN_TASK_DICT[event_type]  # 事件→主任务名映射
-        disk_ids = event_param['disk_ids']
+@spool
+def spool_task(args):
+    """uWSGI Spooler 入口——每次轮询调用这个函数"""
+    request_id = create_uuid()
+    event_id = args['event_id']
+    event_type = args['event_type']
+    close_old_connections()              # 关闭旧的数据库连接
+    EventCenter(event_type, event_id, request_id).event_route()
 
-        for disk in disk_queryset:
-            # 为每个云盘单独创建 task
-            task_param = gen_task_param(maintask_name, ResourceType.EBS, resource_id,
-                                        region_id, az_code, customer_id, global_context)
-            task_id = create_uuid()
-            ebs_task = gen_task_instance(task_id, resource_id, az_id, customer_id,
-                                         now, event, event_type, task_param, EcsCloudType.EBS)
-            ebs_task_list.append(ebs_task)
 
-        # 批量写入 CloudOsTask 表
-        CloudOsTask.objects.bulk_create(ebs_task_list)
+class EventCenter(object):
+    RC = RedisHelper()                   # Redis 客户端（用于分布式锁）
+
+    def event_route(self):
+        """事件路由——Spooler 的核心调度逻辑"""
+        # 1. 时间检查：事件是否到了处理时机
+        if not self._check_time(self.event):
+            spool_task.spool(event_id=self.event_id, event_type=self.event_type)
+            return
+
+        flag = False
+        try:
+            # === 2. Redis 分布式锁：防止同一事件被重复处理 ===
+            flag = self.RC.set_nx_key(self.event_id, self.event_type)
+            if not flag:
+                logger.info('事件<{}>获取锁失败, 已有相同事件在执行'.format(self.event_id))
+                return
+            self.RC.set_expire(self.event_id, 180)   # 锁 180 秒过期
+
+            # 3. 状态路由
+            if self.event.status == EcsTaskStatus.INIT:
+                if CloudOsTask.objects.filter(event_id=self.event_id).exists():
+                    # 已有子任务 → 检查子任务状态
+                    continue_flag = self._check_task_status()
+                else:
+                    # 无子任务 → 根据事件类型创建子任务
+                    try:
+                        if self.event_supplier == CloudSupplierType.CDS:
+                            continue_flag = self._common_init_event(
+                                self._event_handle_route(self.event.event_type))
+                        else:
+                            continue_flag = self._common_init_event(
+                                self._multi_cloud_event_handle_route(self.event.event_type),
+                                supplier=self.event_supplier)
+                    except Exception as e:
+                        logger.exception('事件初始化失败event_id:{}'.format(self.event_id))
+                        continue_flag = True
+
+            elif self.event.status == EcsTaskStatus.DOING:
+                # 事件进行中 → 轮询子任务状态
+                continue_flag = self._check_task_status()
+            else:
+                continue_flag = False
+
+        except Exception as e:
+            continue_flag = True
+        finally:
+            # 4. 释放 Redis 锁
+            if flag and self.RC.get_key(self.event_id):
+                self.RC.delete_key([self.event_id])
+
+        # 5. 未完成 → 重新注册到 Spooler 等待下次执行
+        if continue_flag:
+            time.sleep(5)
+            spool_task.spool(event_id=self.event_id, event_type=self.event_type)
 ```
 
-任务执行成功后，`EbsTaskSet` 负责更新状态 + 回调计费：
+任务状态汇总逻辑：
 
 ```python
-# ecs-service/spool_service/task_service/ebs_task_service.py
-class EbsTaskSet(CommonTaskSet):
+# spool_consumer.py — 事件状态 = 子任务状态的汇总
+def _gen_event_task(self):
+    ecs_task_status_list = CloudOsTask.objects.filter(
+        event_id=self.event_id).values_list('status', flat=True)
 
-    @staticmethod
-    def mount_disk_success(ebs_task):
-        """挂载成功后更新状态"""
-        disk_id = ebs_task.cloud_id
-        disk = CloudOsDisk.objects.get(disk_id=disk_id, is_valid=True)
-        # ... 更新 disk 状态 ...
+    all_finish_flag = True
+    part_success_flag = False
+    part_fail_flag = False
 
-    def common_op_ebs_error(self, ebs_task):
-        """任何操作失败后的事务回滚"""
-        with transaction.atomic():
-            CloudOsDisk.objects.filter(...).update(**kwargs)
+    for task_status in ecs_task_status_list:
+        if task_status in EcsTaskStatus.DOING_STATUS_SET:
+            all_finish_flag = False
+            break
+        elif task_status == EcsTaskStatus.SUCCESS:
+            part_success_flag = True
+        elif task_status == EcsTaskStatus.FAILED:
+            part_fail_flag = True
+
+    if all_finish_flag:
+        if part_fail_flag:
+            if not part_success_flag:
+                event_status = EcsTaskStatus.FAILED        # 全部失败
+            else:
+                event_status = EcsTaskStatus.PART_FAIL     # 部分失败
+        else:
+            event_status = EcsTaskStatus.SUCCESS            # 全部成功
+    else:
+        event_status = EcsTaskStatus.DOING                 # 进行中
+    return event_status
 ```
 
 **面试话术：**
 
-> "我们没用 Celery，用的是 uWSGI 自带的 Spooler。好处是零额外组件——不需要 RabbitMQ、不需要单独 Worker 进程。Spool Consumer 轮询 `CloudOsEvent` 表，发现 pending 事件就拆成子任务写入 `CloudOsTask` 表。每个云盘资源一个 task，批量创建用 `bulk_create`。任务执行后 `EbsTaskSet` 负责成功回调和失败回滚。选 Spooler 是实用主义的选择——云资源操作本身就是异步的，不需要 Celery 那么重的任务调度。"
+> "Spooler 的工作原理是**事件表 + 子任务表 + Redis 锁**的组合。`@spool` 装饰器是 uWSGI 自带的——把函数注册为 Spooler 任务，uWSGI 进程池里有专门的 Spooler 线程轮询执行。`EventCenter.event_route()` 是核心调度器：先检查时间间隔（处理间隔至少 5 秒避免底层接口压力过大），然后 `Redis.set_nx_key(event_id)` 获取分布式锁防止同一事件被多个 Spooler 线程并发处理，再根据事件状态路由——INIT 创建子任务、DOING 轮询子任务进度、完成则关锁。`_gen_event_task()` 把子任务状态汇总为事件状态——全部成功→SUCCESS、部分失败→PART_FAIL、全部失败→FAILED、有进行中→DOING。"
 
 ---
 
@@ -3151,27 +3213,169 @@ users = CustomerUser.objects.using('cdscp').filter(is_valid=True)
 
 ---
 
-## Q12: Kafka 状态同步
+## Q12: Kafka 状态同步——消费虚拟化层上报
 
 **场景理解：**
 
-虚拟化层（compute-admin）的物理机和虚拟机状态变更后，通过 Kafka 上报。ecs-service 启动 Kafka Consumer，消费消息后更新 MySQL 中的对应记录。
+虚拟化层（compute-admin）的物理机和虚拟机状态变更后，通过 Kafka 上报。ecs-service 的 `KafkaConsumerHelper` 消费消息后直接更新 MySQL，不经过 Spooler 管道（因为是单向状态同步，不是用户触发的操作）。
+
+**真实源码：**
+
+```python
+# ecs-service/utils/kafka_kit.py — 真实源码
+from kafka import KafkaConsumer, TopicPartition
+
+class KafkaConsumerHelper(object):
+    def __init__(self, bootstrap_servers, group_id):
+        self.bootstrap_servers = bootstrap_servers
+        self.group_id = group_id
+        self.op_user = 'kakfa_sync'              # 系统用户标识
+        self.instance_type_list = ['vm', 'host']  # 同步两种资源类型
+        self.status_map = {
+            'RUNNING':  EcsResourceStatus.RUNNING,
+            'SHUTDOWN': EcsResourceStatus.SHUTDOWN,
+            'OFF':      HostPowerStatus.SHUTDOWN,
+            'ON':       HostPowerStatus.RUNNING
+        }
+
+    def get_event_data(self, topic, partition):
+        """消费指定 topic 的指定 partition"""
+        logger.info('开始消费数据：topic：{}，partition：{}'.format(topic, partition))
+        local_consumer = KafkaConsumer(
+            group_id=self.group_id,
+            bootstrap_servers=self.bootstrap_servers,
+            consumer_timeout_ms=5000)
+        tp = TopicPartition(topic, partition)
+        local_consumer.assign([tp])
+
+        for msg in local_consumer:
+            data = eval(msg.value.decode('utf-8'))
+            instance_type = data.get('instance_type')  # 'vm' or 'host'
+            event_info = data.get('event_info', {})
+            instance_id = data.get('instance_id')
+            timestamp = int(str(data.get('timestamp'))[:10])
+
+            # ===== 时间戳校验：防止旧消息覆盖新状态 =====
+            message_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
+
+            if instance_type == 'vm':
+                # 查该VM的最新任务更新时间
+                final_task_obj = CloudOsTask.objects.filter(
+                    cloud_id=instance_id).order_by('-id').first()
+                if message_time < str(final_task_obj.update_time):
+                    logger.info('消息时间早于最新任务更新时间，跳过')  # 防止旧消息覆盖
+                    continue
+
+                # 直接更新 ECS 状态
+                CloudOsEcs.objects.filter(
+                    ecs_id=instance_id,
+                    status__in=EcsResourceStatus.BEFORE_KAFKA_SYNC_STATUS_LIST
+                ).update(status=power_status)
+
+                # 同步修复挂载盘状态（处于 error 的盘恢复为 running）
+                CloudOsDisk.objects.filter(
+                    ecs_id=ecs_ins_id, is_valid=True,
+                    status=DiskResourceStatus.ERROR
+                ).update(status=DiskResourceStatus.RUNNING)
+
+            else:  # host——物理机
+                machine_status = event_info.get('machine_status')
+                # 电源+机器状态组合校验
+                if status in self.pass_power_status_list and \
+                   machine_status in self.pass_machine_status_list:
+                    CloudOsHost.objects.filter(
+                        host_id=instance_id, is_valid=True,
+                        update_time__lt=message_time
+                    ).exclude(
+                        machine_status__in=[HostMachineStatus.OFF_SHELVES,
+                                            HostMachineStatus.ONLINE_MAINTENANCE]
+                    ).update(power_status=power_status, machine_status=machine_status)
+```
 
 **面试话术：**
 
-> "Kafka 在我们的架构里做**异步状态同步**。虚拟化层是状态的真实来源——主机宕机、ECS 异常重启，都由 compute-admin 通过 Kafka 上报。ecs-service 作为唯一能写状态的消费方，保证状态的单点一致性。Kafka Consumer 是独立进程，随 uWSGI 一起启动。消息按 topic 分区，每个 partition 一个 consumer 线程，保证同 partition 内消息的顺序处理。"
+> "Kafka Consumer 是独立的后台线程，直接消费虚拟化层上报的状态变更消息。关键设计有两个——**时间戳校验**防止旧消息覆盖新状态（比对新消息时间和 `CloudOsTask.update_time`），**状态过滤**只更新特定状态范围内的资源（`BEFORE_KAFKA_SYNC_STATUS_LIST`）。和 Spooler 的区别是：Kafka 是**源端被动上报**，不需要拆分任务链，直接写 MySQL；Spooler 是**用户主动操作**，需要事件→任务→轮询→回调的四步流程。"
 
 ---
 
-## Q13: Redis 的使用场景
+## Q13: Redis 的使用场景（真实代码）
 
 **场景理解：**
 
-三个服务共享 Redis Cluster，主要三个用途——缓存热点数据、分布式锁、Session 管理。
+三个服务共享 Redis Cluster。真实源码在 `utils/redis_kit.py`——基于 `rediscluster.StrictRedisCluster`。
+
+**真实源码：**
+
+```python
+# ecs-service/utils/redis_kit.py — 真实源码
+from rediscluster import StrictRedisCluster as rc
+
+class RedisHelper(object):
+    DEFAULT_EXPIRE_TIME = 300  # 默认过期 5 分钟
+    MAX_COMMANDS = 10          # Pipeline 批量上限
+
+    def __init__(self):
+        self.redis_nodes = settings.REDIS_CLUSTER_NODES
+        self.password = getattr(settings, 'REDIS_CLUSTER_PASSWORD', None)
+        self.r = rc(startup_nodes=self.redis_nodes,
+                     decode_responses=True, password=self.password)
+
+    # === 基础 K-V ===
+    def set_key(self, key, value, expire=DEFAULT_EXPIRE_TIME):
+        self.r.set(key, value, ex=expire)
+
+    def get_key(self, key):
+        return self.r.get(key)
+
+    # === JSON 缓存 ===
+    def set_json_key(self, key, value, expire=DEFAULT_EXPIRE_TIME):
+        self.r.set(key, json.dumps(value), ex=expire)
+
+    def get_json_key(self, key):
+        value = self.get_key(key)
+        return json.loads(value) if value else value
+
+    # === Pipeline 批量操作 ===
+    def pipe_set_key(self, data, expire=DEFAULT_EXPIRE_TIME):
+        """批量 SET——一次网络往返写多个 key"""
+        r_pipe = self.r.pipeline()
+        for key, value in data.items():
+            r_pipe.set(key, json.dumps(value) if isinstance(value, dict) else value, ex=expire)
+        r_pipe.execute()
+
+    def pipe_get_json_key(self, keys=[]):
+        """批量 GET——一次网络往返读多个 key"""
+        records = {}
+        r_pipe = self.r.pipeline()
+        for index, key in enumerate(keys):
+            r_pipe.get(key)
+        for (k, v) in zip(keys, r_pipe.execute()):
+            records[k] = json.loads(v) if v else v
+        return records
+
+    # === 分布式锁（SETNX）===
+    def set_nx_key(self, key, value):
+        """SETNX——键不存在才写，用于分布式锁"""
+        return self.r.setnx(key, value)
+
+    def set_expire(self, key, time=DEFAULT_EXPIRE_TIME):
+        self.r.expire(key, time)
+
+    def delete_key(self, names):
+        return self.r.delete(*names)
+```
+
+**三个实际使用场景：**
+
+| 场景 | 方法 | 代码位置 |
+|------|------|------|
+| **分布式锁** | `RC.set_nx_key(event_id, event_type)` + `set_expire(event_id, 180)` | `spool_consumer.py:540` |
+| **热点缓存** | `set_json_key(key, value)` / `get_json_key(key)` | 用户信息、机房配置 |
+| **批量查询** | `pipe_get_json_key(keys)` | 一次查多个资源的状态 |
 
 **面试话术：**
 
-> "Redis 在我们的架构里主要三个角色：**分布式锁**用于防止并发操作同一资源——比如同一台物理机不能同时被两个运维人员设为维护模式；**热点缓存**存用户信息和机房配置，减少 MySQL 查询；**Session 管理**存 SSO 登录状态。Redis 是集群模式，通过 Django 的 `django-redis` 集成，支持 failover。"
+> "Redis 在三处核心使用。最关键是**分布式锁**——Spooler 的 `event_route()` 用 `SETNX(event_id)` 防止同一事件被多个 Spooler 线程并发处理，180 秒自动过期防死锁。**热点缓存**用 `set_json_key/get_json_key` 存用户信息和机房配置，5 分钟过期，减少 MySQL 查询。**Pipeline 批量**用于一次查询多个 key——`pipe_get_json_key` 把多次 GET 合并成一次网络往返，避免循环 RTT。Redis 是集群模式（`rediscluster.StrictRedisCluster`），配置节点列表在 `settings.REDIS_CLUSTER_NODES`。"
 
 ---
 
@@ -3212,36 +3416,114 @@ def set_operation(self, disk_ids, content, status, operation_type=OperationType.
 
 ---
 
-## Q15: SSO 认证 + 权限校验
+## Q15: SSO 认证 + 权限校验（真实代码）
 
 **场景理解：**
 
-三个服务共用同一套 SSO Token 验证。gic-business 和 ecs-business（面向用户/运维）需要认证，ecs-service（纯内部调用）不需要。
+两个面向用户的业务服务（gic-business、ecs-business）使用 SSO Token 认证，纯内部调用的 ecs-service 不做认证。两个服务的 Auth 实现略有不同，但核心流程一致。
+
+### 15.1 gic-business 的 @login_required（用户侧）
+
+```python
+# gic-business/apps/auth.py — 真实源码
+from utils.request_service import UserCenterRequest
+from utils.redis_kit import RedisHelper
+
+def login_required(func):
+    """GIC 用户控制台的登录验证装饰器"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        req = args[1]
+        # === 1. 从三个位置提取 Token ===
+        token = (req.GET.get('token')                         # URL 参数
+                 or req.headers.get(settings.OSS_TOKEN_HEADER_NAME)  # Header
+                 or req.COOKIES.get(settings.OSS_TOKEN_COOKIE_NAME)) # Cookie
+
+        if not token:
+            return get_redirect_login_res()     # 401 + SSO 重定向URL
+
+        # === 2. 调 UserCenter 验证 Token ===
+        try:
+            res = UserCenterRequest.get_user_info(headers={'Access-Token': token})
+        except BusinessException:
+            return get_redirect_login_res()
+
+        # === 3. 提取用户信息注入到请求参数 ===
+        user_data = res['user']
+        customer_data = res['customer']
+        kwargs.setdefault('data', {})
+        kwargs['data']['customer_id'] = customer_data['id']
+        kwargs['data']['user_id'] = user_data['acct_user_id']
+        kwargs['data']['user_name'] = user_data['username']
+        kwargs['data']['main_user_id'] = CustomerUser.get_main_user_id(customer_data['id'])
+        kwargs['data']['user_ip'] = get_user_ip_by_request(req)
+        kwargs['data']['customer_source'] = customer_data.get('customer_source', '')
+
+        return func(*args, **kwargs)
+    return wrapper
+```
+
+### 15.2 ecs-business 的 TokenAuthBackend（运维侧）
+
+```python
+# ecs-business/apps/auth.py — 真实源码
+from django.contrib.auth.backends import ModelBackend
+
+class TokenAuthBackend(ModelBackend):
+    """Django 自定义认证后端——根据 SSO Token 验证运维用户"""
+
+    def authenticate(self, token=None, **kwargs):
+        usr = login_ucenter_user(token)   # 调 ucenter 验证 Token
+        return usr if usr else None
+
+    def get_user(self, user_id):
+        return User.objects.get(pk=user_id)
+
+def get_user_with_token(token):
+    """调 SSO 服务获取用户信息"""
+    response = requests.get(
+        urljoin(settings.GET_USER_INFO, 'currentInfo'),
+        headers={
+            'Accept': 'application/json',
+            'Access-Token': token,
+        }
+    )
+    if response.status_code != 200:
+        return {}
+    return response.json()
+```
+
+### 15.3 在 View 层的使用
 
 ```python
 # ecs-business/apps/api/views/ebs.py — 真实源码
 class EbsView(GenericViewSet):
 
-    @login_required    # ← SSO 登录验证
+    @login_required         # ← gic-business 装饰器
     @response
     def mount(self, req, data):
         op = EbsOperateService(
-            data['customer_id'],     # 从请求参数获取客户ID
-            req.user.username,        # 从 SSO token 获取操作用户名
+            data['customer_id'],     # 装饰器注入的客户ID
+            req.user.username,        # SSO Token 解析出的用户名
         )
         res = op.api_mount_ebs(data)
         return res
 
-# @login_required 装饰器做了什么：
-# 1. 从 Header 提取 SSO token
-# 2. 调 ucenter 服务验证 token 有效性
-# 3. 将 user 对象绑定到 req.user
-# 4. token 无效 → 401
+    @login_required
+    @response
+    def create_disk(self, req, data):
+        op = EbsOperateService(
+            data['customer_id'],
+            req.user.username,
+            OpSource.CLOUD_OP          # 运维操作标识
+        )
+        res = op.api_create_ebs(data)
+        return res
 ```
 
 **面试话术：**
 
-> "三个服务的认证策略不同：gic-business 和 ecs-business 用 `@login_required` 装饰器 + SSO Token，ecs-service 是纯内部调用不做认证。`customer_id` 从请求参数传入——保证了'用户只能操作自己的资源'（Backend 层的 `check_customer_ecs`、`check_customer_disks` 基于 customer_id 校验）。运维侧用 `OpSource.CLOUD_OP` 标识区分管理员操作。"
+> "认证分两层——`@login_required` 装饰器负责身份认证（是谁），Backend 层的 `check_customer_ecs/check_customer_disks` 负责资源授权（有没有权限操作这个资源）。Token 从三个地方取（URL参数/Header/Cookie），优先级从高到低。验证走 `UserCenterRequest.get_user_info()` 调 SSO 服务，返回用户信息和客户信息。验证成功后把 `customer_id`、`user_name` 等注入到 `kwargs['data']`，后续 Backend 层直接用。ecs-service 不做认证——它是纯内部服务，外部请求由 gic-business/ecs-business 校验后才转发过来。"
 
 ---
 
