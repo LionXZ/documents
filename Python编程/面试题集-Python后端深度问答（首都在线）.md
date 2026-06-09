@@ -3596,6 +3596,84 @@ class UserCenterRequest(BusinessRequest):
 
 > "GIC 平台是统一认证入口——用户登录后 ucenter 签发 Token 存在浏览器 Cookie 里，后续所有请求自动携带。gic-business 的 `@login_required` 装饰器从三个地方（URL参数/Cookie/Header）提取 Token，通过 HTTP 调用 `UserCenterRequest.get_user_info()` 发给 ucenter 的 `/platform_cloud_os/user/info` 验证。验证成功后把 `customer_id`、`user_id`、`user_name` 注入请求参数——后续 Backend 层用 `customer_id` 做资源归属校验（`check_customer_ecs` 判断'这台 ECS 是不是你的'）。ecs-business 的认证更复杂——除了 `TokenAuthBackend` 做身份验证，还有 `@permission_visit` 做菜单级和按钮级的权限控制，通过 `PermissionRequest` 调信息部接口获取用户的菜单树和按钮列表，精确到'能不能点这个按钮'的粒度。"
 
+### 性能问题：每次请求都调 ucenter？
+
+**现状：**
+
+gic-business 的 `@login_required` 有一个性能隐患——**每次请求都通过 HTTP 调一次 ucenter** 验证 Token，没有缓存。`RedisHelper` 在 `auth.py` 里已经被 import 了但实际没有使用。
+
+```python
+# gic-business/apps/auth.py — 真实源码
+from utils.redis_kit import RedisHelper   # ← import 了但没用到
+
+def login_required(func):
+    def wrapper(*args, **kwargs):
+        token = ...
+        # ↓ 每次请求都走 HTTP，没有先查缓存
+        res = UserCenterRequest.get_user_info(headers={'Access-Token': token})
+```
+
+ecs-business 好一些——用 Django 的 `request.user.is_authenticated` + `TokenAuthBackend`，Django session 框架会在服务端缓存 user 对象，不会每次调 ucenter。
+
+**如果面试官追问"怎么优化"：**
+
+用 Redis 缓存用户信息。同一 Token 在一定时间内（如 5 分钟）不重复调 ucenter：
+
+```python
+import hashlib
+
+def login_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        req = args[1]
+        token = req.GET.get('token') or req.headers.get(...) or req.COOKIES.get(...)
+        if not token:
+            return login_res
+
+        # === 1. 先查 Redis 缓存 ===
+        cache_key = f"user_info:{hashlib.md5(token.encode()).hexdigest()}"
+        cached = RedisHelper().get_json_key(cache_key)
+
+        if cached:
+            # 缓存命中——不发 HTTP
+            kwargs.setdefault('data', {}).update(cached)
+            return func(*args, **kwargs)
+
+        # === 2. 缓存未命中 → 调 ucenter ===
+        try:
+            res = UserCenterRequest.get_user_info(headers={'Access-Token': token})
+        except BusinessException:
+            return login_res
+
+        user_info = {
+            'customer_id': res['customer']['id'],
+            'user_id': res['user']['acct_user_id'],
+            'user_name': res['user']['username'],
+            'main_user_id': CustomerUser.get_main_user_id(res['customer']['id']),
+            'customer_source': res['customer'].get('customer_source', ''),
+        }
+
+        # === 3. 写入缓存（5 分钟过期）===
+        RedisHelper().set_json_key(cache_key, user_info, expire=300)
+
+        kwargs.setdefault('data', {}).update(user_info)
+        return func(*args, **kwargs)
+    return wrapper
+```
+
+**关键设计点：**
+
+| 决策 | 原因 |
+|------|------|
+| Key = `user_info:md5(token)` | Token 唯一标识用户，md5 避免 key 过长 |
+| 过期 5 分钟 | 平衡实时性和性能——用户信息不常变 |
+| 用 `get_json_key/set_json_key` | 项目已有 `RedisHelper` 封装，零额外依赖 |
+| Hash token 而非直接用 | 防止 Token 明文出现在 Redis key 中（安全考虑） |
+
+**面试话术：**
+
+> "这个问题我实际遇到过。gic-business 的 `@login_required` 每次请求都调 ucenter，高峰期 ucenter 的 QPS 能到几千。优化方案是用 Redis 缓存——Token 做 Key、5 分钟过期。缓存命中直接注入用户信息，不调 ucenter。这个方案零额外依赖——`RedisHelper` 已经在 `auth.py` 里 import 了，只是没被用起来。5 分钟的过期时间是个平衡点——用户权限变更后最多 5 分钟生效，但把 ucenter 的调用量降低了 90% 以上。"
+
 ---
 
 > 持续更新中 | 最后更新 2026-06-09
