@@ -3527,4 +3527,75 @@ class EbsView(GenericViewSet):
 
 ---
 
-> 持续更新中 | 最后更新 2026-06-08
+### Q15 补充：Token 认证的完整链路（GIC 统一认证 → Business 校验）
+
+**全景流程：**
+
+```
+用户浏览器
+    ↓ 登录 GIC 控制台（用户名+密码）
+GIC 前端 → ucenter SSO 服务 → 返回 access_token (通过 cookie 回传)
+    ↓ 后续每次请求自动带 cookie
+gic-business 后端
+    ↓ @login_required 装饰器
+    ├─ 1. 从三个位置提取 token (URL/Cookie/Header)
+    ├─ 2. 调 UserCenterRequest.get_user_info() → HTTP GET 到 ucenter
+    │      URL: /platform_cloud_os/user/info
+    │      Header: {'Access-Token': token}
+    │      返回: {user: {acct_user_id, username}, customer: {id, customer_source}}
+    ├─ 3. 校验失败 → 401 + SSO 重定向 URL
+    └─ 4. 校验成功 → 注入 customer_id, user_id, user_name 到 kwargs['data']
+```
+
+**gic-business 的 get_user_info 是什么？**
+
+```python
+# gic-business/utils/request_service.py — 真实源码
+class UserCenterRequest(BusinessRequest):
+    MC_SERVICE_URL = settings.MC_SERVICE_URL              # ucenter 服务地址
+    MC_SERVICE_URL_NEW = settings.MC_SERVICE_URL_NEW      # 新版 ucenter 地址
+    GET_USER_INFO_URL = urljoin(MC_SERVICE_URL_NEW,
+                                '/platform_cloud_os/user/info')  # 用户信息端点
+
+    @classmethod
+    def get_user_info(cls, headers):
+        """调 ucenter 验证 token 并获取用户+客户信息"""
+        res = cls.user_get(cls.GET_USER_INFO_URL, {'headers': headers})
+        return res  # {'user': {...}, 'customer': {...}}
+```
+
+**两个 business 的认证差异：**
+
+| 维度 | gic-business（用户侧） | ecs-business（运维侧） |
+|------|------|------|
+| 装饰器 | 函数级 `@login_required` | Django `TokenAuthBackend` + `@login_required` |
+| Token 来源 | URL/Cookie/Header | Cookie(4种) |
+| 返回用户信息 | `user_data['acct_user_id']` + `customer_data['id']` | `employee` 员工信息 → `Staff` 模型 |
+| 权限控制 | 资源级（check_customer_ecs 判归属） | 菜单级（`@permission_visit` 判菜单权限） |
+
+**关键区别——gic-business 的 Token 是 GIC 控制台登录获取的云平台 Token，ecs-business 的 Token 是内部 SSO Token：**
+
+- gic-business：用户在前端登录 GIC → ucenter 签发 Token → 存在前端 Cookie → 请求时自动带上 → `@login_required` 调 `/platform_cloud_os/user/info` 验证
+- ecs-business：运维人员在 SSO 登录 → 拿到内部 Token → `TokenAuthBackend.authenticate()` 调 `GET_USER_INFO/currentInfo` 验证 → 同步员工信息到本地 `Staff` 表 → 再走 Django 的 `request.user.is_authenticated` 判断
+
+**权限控制：**
+
+```python
+# ecs-business 的权限装饰器（真实源码）——比 gic-business 更完善
+@permission_required('cloud_os.view_host')        # Django 级权限
+@permission_visit('host_manage.button_reboot')     # 菜单+按钮级权限
+
+# permission_visit 的实现：
+# 1. 调 PermissionRequest 获取用户可访问的菜单列表和按钮列表
+# 2. 比对 visit_params（格式: "目录code.按钮code"）
+# 3. 如果 '.' 分割 → 验证菜单+按钮权限
+# 4. 没有 '.' → 只验证菜单权限
+```
+
+**面试话术：**
+
+> "GIC 平台是统一认证入口——用户登录后 ucenter 签发 Token 存在浏览器 Cookie 里，后续所有请求自动携带。gic-business 的 `@login_required` 装饰器从三个地方（URL参数/Cookie/Header）提取 Token，通过 HTTP 调用 `UserCenterRequest.get_user_info()` 发给 ucenter 的 `/platform_cloud_os/user/info` 验证。验证成功后把 `customer_id`、`user_id`、`user_name` 注入请求参数——后续 Backend 层用 `customer_id` 做资源归属校验（`check_customer_ecs` 判断'这台 ECS 是不是你的'）。ecs-business 的认证更复杂——除了 `TokenAuthBackend` 做身份验证，还有 `@permission_visit` 做菜单级和按钮级的权限控制，通过 `PermissionRequest` 调信息部接口获取用户的菜单树和按钮列表，精确到'能不能点这个按钮'的粒度。"
+
+---
+
+> 持续更新中 | 最后更新 2026-06-09
