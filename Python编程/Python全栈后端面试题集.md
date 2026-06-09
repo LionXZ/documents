@@ -4026,6 +4026,114 @@ Rust:  源代码 → 编译器（rustc） → 机器码
 
 ---
 
+#### 7. 列表推导式与生成器表达式的区别
+
+**一句话总结：** 列表推导式 `[x for x in ...]` 一次性生成所有元素存入内存；生成器表达式 `(x for x in ...)` 按需惰性产出，不占内存。
+
+```python
+# ── 语法对比 ──
+lst = [x * 2 for x in range(5)]   # 列表推导式，用 []
+gen = (x * 2 for x in range(5))   # 生成器表达式，用 ()
+
+print(lst)  # [0, 2, 4, 6, 8]  ← 全部已生成，可直接访问
+print(gen)  # <generator object <genexpr> at 0x...>  ← 只是一个"配方"
+
+# 访问生成器：逐个产出
+print(next(gen))  # 0
+print(next(gen))  # 2
+print(list(gen))  # [4, 6, 8]  ← 仅剩的 3 个
+```
+
+**核心区别：**
+
+| 维度 | 列表推导式 `[...]` | 生成器表达式 `(...)` |
+|------|------|------|
+| **内存** | 一次性分配全部内存 | 只保存状态，按需产出（几乎不占内存） |
+| **求值时机** | 立即求值（eager） | 惰性求值（lazy），迭代时才计算 |
+| **可重用性** | 可反复遍历 | 只能遍历一次，用完即空 |
+| **随机访问** | 支持 `lst[3]` 索引访问 | 不支持索引 |
+| **类型** | `list` | `generator` |
+
+```python
+# ── 内存对比（关键差异）──
+import sys
+
+# 100 万个元素的列表推导式 → 约 8MB
+big_list = [x for x in range(1_000_000)]
+print(f"列表: {sys.getsizeof(big_list) / 1024 / 1024:.1f}MB")
+
+# 100 万个元素的生成器表达式 → 约 200 字节！
+big_gen = (x for x in range(1_000_000))
+print(f"生成器: {sys.getsizeof(big_gen)} 字节")  # 约 200 字节 → 差 4 万倍！
+
+# ── 一次性 vs 可复用 ──
+gen = (x for x in range(3))
+print(sum(gen))   # 3  → 第一次遍历
+print(sum(gen))   # 0  → 第二次遍历：生成器已耗尽！
+
+lst = [x for x in range(3)]
+print(sum(lst))   # 3
+print(sum(lst))   # 3  → 列表可反复使用
+```
+
+**实战场景选择：**
+
+```python
+# ✅ 用列表推导式的场景：
+# 1. 需要多次遍历
+data = [parse_line(line) for line in file.readlines()]
+
+# 2. 需要索引/切片/长度
+ids = [user.id for user in active_users]
+print(ids[:10], len(ids))
+
+# 3. 数据量本身就小（< 10000）
+colors = [c.upper() for c in ['red', 'green', 'blue']]
+
+# ✅ 用生成器表达式的场景：
+# 1. 数据量可能非常大（文件读取、数据库游标）
+lines = (line.strip() for line in open('huge_file.log'))
+errors = [line for line in lines if 'ERROR' in line]  # 过滤后才存内存
+
+# 2. 只需要遍历一次（传给 sum/max/any/all 等）
+total = sum(x * x for x in range(10_000_000))  # 不会创建千万级列表
+
+# 3. 管道式处理（多个生成器串联，内存占用保持恒定）
+nums = (int(line) for line in open('data.txt'))
+evens = (n for n in nums if n % 2 == 0)
+squares = (n * n for n in evens)
+result = sum(squares)  # 整个过程只有一个记录在内存中流动
+
+# ❌ 常见错误：在需要多次遍历时使用生成器
+gen = (x for x in range(5))
+if 3 in gen:     # 遍历到 3，前面的值已消耗
+    print("found")
+    for x in gen:  # 只能拿到 4，0-3 已丢失！
+        print(x)   # 输出: 4
+```
+
+**进阶：`yield` 自定义生成器**
+
+```python
+# 生成器表达式适合简单逻辑，复杂逻辑用 yield
+def fibonacci_generator(limit: int):
+    """生成不超过 limit 的所有斐波那契数（惰性）"""
+    a, b = 0, 1
+    while a <= limit:
+        yield a
+        a, b = b, a + b
+
+# 只产出需要的值，不预计算
+fib = fibonacci_generator(1000)
+print(list(fib))  # [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987]
+```
+
+**面试话术：**
+
+> "列表推导式和生成器表达式的核心区别是**内存模型**——前者一次性生成所有元素到内存，后者按需惰性产出。实际选择看两个条件：数据量大小和是否需要多次遍历。大数据量 + 一次遍历 → 生成器；小数据量或需要多次访问 → 列表。还有一个容易被忽略的点——生成器表达式放在 `sum()`、`max()`、`any()` 等函数里时可以省略外层的括号，比如 `sum(x for x in range(10))` 而不是 `sum((x for x in range(10)))`，语法上更简洁。在 Python 项目中，处理文件、数据库游标、API 分页这类大流量数据时，生成器是标配——你不会想把 100 万行日志一次全部读到内存里。"
+
+---
+
 ### 三、编程题
 
 #### 1. 请实现两个 5 进制的整数加法
