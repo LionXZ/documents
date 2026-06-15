@@ -159,6 +159,7 @@ file unknown.bin                 # 告诉你这是什么文件
 ls -lh file.txt                  # 单个文件
 du -sh folder/                   # 目录总大小
 du -h --max-depth=1 /var         # 一层子目录各占多少
+# >  macOS: du -h -d 1 /var
 du -sh *                         # 当前目录下每个文件/目录的大小
 
 # 文件统计
@@ -306,10 +307,16 @@ sudo su - username               # 变成某用户
 # 创建用户
 useradd -m -s /bin/bash newuser  # 创建用户（-m 创建家目录）
 passwd newuser                   # 设置密码
+# >  macOS 创建用户:
+# >  sudo sysadminctl -addUser newuser -fullName "New User" -password pwd123
+# >  macOS 没有 useradd，用 sysadminctl 或「系统设置 → 用户与群组」
 
 # 把用户加入 sudo 组（让他能用 sudo）
 usermod -aG sudo newuser         # Ubuntu/Debian
 usermod -aG wheel newuser        # CentOS/RHEL
+# >  macOS:
+# >  sudo dseditgroup -o edit -a newuser -t user admin    # 加入 admin 组（管理员）
+# >  sudo dseditgroup -o edit -a newuser -t user wheel    # 加入 wheel 组
 ```
 
 ---
@@ -413,6 +420,9 @@ du -ah / | sort -rh | head -20         # 当前最大的 20 个文件/目录
 mount                            # 查看挂载情况
 lsblk                            # 查看磁盘和分区（树形结构）
 fdisk -l                         # 查看所有磁盘信息
+# >  macOS:
+# >  diskutil list                 # 查看磁盘和分区
+# >  diskutil info /dev/disk0      # 磁盘详细信息
 ```
 
 ### 6.2 内存
@@ -420,6 +430,10 @@ fdisk -l                         # 查看所有磁盘信息
 ```bash
 # 查看内存
 free -h                          # 内存使用概况
+# >  macOS 没有 free 命令，用:
+# >  vm_stat                       # 查看虚拟内存统计
+# >  memory_pressure               # 内存压力（macOS 特有，更直观）
+# >  top -l 1 | grep PhysMem       # 物理内存使用
 #               total   used   free   shared   buff/cache   available
 # Mem:           7.6G    2.1G   1.2G    234M        4.3G        5.0G
 # Swap:          2.0G     0B    2.0G
@@ -428,8 +442,12 @@ free -h                          # 内存使用概况
 # buff/cache 是系统缓存，需要时可以被回收
 
 cat /proc/meminfo                # 详细内存信息
+# >  macOS 没有 /proc/meminfo，用 sysctl 查看硬件信息:
+# >  sysctl hw.memsize             # 总内存（字节）
+# >  sysctl -a | grep mem          # 所有内存相关参数
 vmstat 1                         # 每秒刷新内存/CPU/IO
 top -o %MEM                      # 按内存使用排序
+# >  macOS 的 top 用: top -o mem
 ```
 
 ---
@@ -442,9 +460,12 @@ top -o %MEM                      # 按内存使用排序
 # 查看 IP
 ip a                             # 新方式（推荐）
 ifconfig                         # 旧方式（可能需要装 net-tools）
+# >  macOS 没有 ip 命令，用 ifconfig 或:
+# >  networksetup -listallhardwareports   # 查看所有网络接口
 
 # 查看路由
 ip route                         # 默认网关等信息
+# >  macOS: netstat -rn            # 查看路由表
 
 # 连通性测试
 ping -c 4 google.com             # 发 4 个包测试
@@ -467,12 +488,17 @@ mtr google.com                   # 动态路由追踪（更好用）
 netstat -tlnp                    # 查看监听的 TCP 端口
 # -t: TCP, -l: 监听, -n: 数字显示, -p: 显示进程名
 netstat -tlnp | grep 8080        # 8080 端口是谁在用
+# >  macOS netstat 是 BSD 版本，参数不同，推荐用 lsof:
+# >  lsof -i -P -n | grep LISTEN  # 查看所有监听的端口
+# >  lsof -i :8080                # 查看 8080 端口被谁占用
 
 ss -tlnp                         # 更现代的替代（速度更快）
+# >  macOS 没有 ss 命令
 
 # 查看所有连接
 netstat -an                      # 所有连接（包括已建立的）
 ss -s                            # 连接统计摘要
+# >  macOS: netstat -an | head
 
 # 检查远程端口是否开放
 nc -zv 10.0.0.1 3306             # 测试端口是否通
@@ -482,6 +508,9 @@ telnet 10.0.0.1 3306             # 同上
 iptables -L                      # 查看防火墙规则
 firewall-cmd --list-all          # CentOS 7+ firewalld
 ufw status                       # Ubuntu 防火墙
+# >  macOS 防火墙是 PF (Packet Filter):
+# >  sudo pfctl -s all            # 查看所有规则
+# >  sudo pfctl -s info           # 查看防火墙状态
 ```
 
 ### 7.3 下载文件
@@ -544,6 +573,11 @@ sudo yum remove nginx
 apk add nginx                                # 安装
 apk del nginx                                # 卸载
 apk update && apk upgrade                    # 更新所有
+
+# >  macOS 用 Homebrew:
+# >  brew install nginx           # 安装
+# >  brew uninstall nginx         # 卸载
+# >  brew update && brew upgrade  # 更新所有
 ```
 
 ### 8.2 源码编译安装
@@ -921,18 +955,27 @@ journalctl -u ssh --since "1 hour ago"
 uname -a                       # 内核版本、架构等
 cat /etc/os-release            # 系统版本
 hostnamectl                    # 主机名和系统信息
+# >  macOS: sw_vers             # 系统版本
+# >  macOS: scutil --get ComputerName / HostName / LocalHostName
 
 # 硬件
 lscpu                          # CPU 信息
 cat /proc/cpuinfo | grep "model name" | head -1   # CPU 型号
+# >  macOS:
+# >  sysctl -n machdep.cpu.brand_string  # CPU 型号
+# >  sysctl hw                      # 硬件信息总览
 free -h                        # 内存
 lspci                          # PCI 设备
 lsusb                          # USB 设备
+# >  macOS: system_profiler SPHardwareDataType  # 硬件概览
+# >  macOS: system_profiler SPUSBDataType       # USB 设备
 
 # 时间
 date                           # 当前时间
 timedatectl                    # 时区等信息
 cal                            # 日历
+# >  macOS: sudo systemsetup -gettimezone  # 查看时区
+# >  macOS: sudo systemsetup -listtimezones # 列出时区
 
 # 命令历史
 history                        # 查看历史命令
@@ -961,6 +1004,14 @@ systemctl is-enabled nginx          # 是否开机自启
 systemctl list-units --type=service    # 所有服务
 systemctl list-unit-files --type=service  # 所有服务的启用状态
 systemctl list-units --state=failed    # 失败的服务
+
+# >  macOS 用 launchctl 管理服务:
+# >  launchctl list                # 查看所有服务
+# >  launchctl load /Library/LaunchDaemons/xxx.plist    # 加载服务
+# >  launchctl unload /Library/LaunchDaemons/xxx.plist  # 卸载服务
+# >  launchctl start com.xxx.service                     # 启动
+# >  launchctl stop com.xxx.service                      # 停止
+# >  服务 plist 文件位置: ~/Library/LaunchAgents/ 或 /Library/LaunchDaemons/
 ```
 
 ---
@@ -1127,9 +1178,11 @@ find . -name "*.py" -o -name "*.js" | xargs wc -l   # 多种文件
 
 # 查看最耗 CPU 的进程
 ps aux --sort=-%cpu | head -10
+# >  macOS: ps aux -r | head -10          # 按 CPU 排序
 
 # 查看最耗内存的进程
 ps aux --sort=-%mem | head -10
+# >  macOS: ps aux -m | head -10          # 按内存排序
 
 # 快速备份文件
 cp config.conf{,.bak}          # 等同于 cp config.conf config.conf.bak
@@ -1179,7 +1232,7 @@ ps aux | grep xx    # 查进程
 kill -9 PID     # 杀进程
 top             # 看系统负载
 df -h           # 磁盘使用
-free -h         # 内存使用
+free -h         # 内存使用（macOS: vm_stat）
 chmod 755 file  # 改权限
 tar -xzvf f.tar.gz  # 解压
 curl URL        # 发 HTTP 请求
@@ -1194,16 +1247,85 @@ history         # 看用过的命令
 sed -i '' 's/old/new/g' file.txt    # macOS
 sed -i 's/old/new/g' file.txt       # Linux
 
-# 没有 /proc 下的一些内容
-# macOS 用 sysctl 代替
-sysctl -n machdep.cpu.brand_string  # macOS 看 CPU 型号
+# 端口查看
+lsof -i -P -n | grep LISTEN         # macOS（推荐）
+lsof -i :8080                       # macOS 查看特定端口
+netstat -tlnp                        # Linux
+
+# 磁盘
+diskutil list                       # macOS
+lsblk                                # Linux
+
+# 内存
+vm_stat                              # macOS
+memory_pressure                      # macOS（更直观）
+free -h                              # Linux
+
+# 网络
+ifconfig                             # macOS
+ip a                                 # Linux
+
+# 路由表
+netstat -rn                          # macOS
+ip route                             # Linux
+
+# CPU 型号
+sysctl -n machdep.cpu.brand_string   # macOS
+cat /proc/cpuinfo | grep "model name"| head -1   # Linux
+
+# 硬件概览
+system_profiler SPHardwareDataType   # macOS
+lscpu                                # Linux
+
+# 系统版本
+sw_vers                              # macOS
+cat /etc/os-release                  # Linux
 
 # 包管理器
-brew install nginx                   # macOS 用 Homebrew
+brew install nginx                   # macOS
+apt install nginx                    # Linux
 
-# 命令差异
-# 很多 Linux 命令在 macOS 上是 BSD 版本，参数可能不同
-# 如 sed, grep, find 等，查 man 确认
+# 服务管理
+launchctl list                       # macOS
+systemctl list-units --type=service  # Linux
+
+# 防火墙
+sudo pfctl -s all                    # macOS
+iptables -L                          # Linux
+
+# 进程排序
+ps aux -r | head -10                 # macOS 按 CPU 排序
+ps aux -m | head -10                 # macOS 按内存排序
+ps aux --sort=-%cpu | head -10       # Linux
+
+# du 目录深度
+du -h -d 1 /var                      # macOS
+du -h --max-depth=1 /var             # Linux
+
+# 没有 /proc 下的一些内容
+# macOS 用 sysctl 代替
+sysctl -a | grep mem                 # macOS 查看内存参数
+
+# grep 默认不带 --color=auto（BSD 版本）
+# macOS 建议安装 GNU 版本: brew install grep → 使用 ggrep 命令
+```
+
+### macOS 常用独有命令
+
+```bash
+# 软件包管理
+brew search nginx            # 搜索
+brew info nginx              # 查看信息
+brew services start nginx    # 设为开机自启并启动
+
+# 系统信息
+system_profiler              # 完整系统报告（等同于"关于本机"）
+sysctl -a                    # 所有内核参数
+pmset -g                     # 电源管理状态
+
+# 用户管理（macOS 没有 useradd/usermod）
+dscl . -list /Users          # 列出所有用户
+dseditgroup -o edit -a user -t user admin   # 将用户加入 admin 组
 ```
 
 ---
