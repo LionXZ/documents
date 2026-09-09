@@ -268,7 +268,7 @@ async function createDirNode(client, spaceId, { title, parentNodeToken }) {
 // 注：创建节点接口（POST .../nodes）会忽略 obj_token、总是新建空文档，
 //     挂接已有文档必须走 move 接口（同步返回新节点的 wiki_token）
 async function moveDocToWiki(client, spaceId, { objToken, parentNodeToken, title }) {
-  const { wiki_token: nodeToken } = await client.request(
+  const data = await client.request(
     'POST',
     `/wiki/v2/spaces/${spaceId}/nodes/move_docs_to_wiki`,
     {
@@ -279,11 +279,34 @@ async function moveDocToWiki(client, spaceId, { objToken, parentNodeToken, title
       },
     }
   );
+  // 接口为异步语义，wiki_token 有三种来源（按出现顺序取用）：
+  // ① 移动瞬时完成：响应顶层直接返回 wiki_token；
+  // ② 数组结构：move_docs_to_wiki_results[0].wiki_token；
+  // ③ 未完成：仅返回 task_id，需轮询 GET /wiki/v2/tasks/:task_id 拿 move_result
+  let nodeToken = data.wiki_token ?? data.move_docs_to_wiki_results?.[0]?.wiki_token;
+  if (!nodeToken && data.task_id) nodeToken = await pollMoveTask(client, data.task_id);
+  if (!nodeToken) {
+    throw new Error(`move_docs_to_wiki 响应中未找到 wiki_token，原始响应：${JSON.stringify(data)}`);
+  }
   // move 后节点标题沿用文档标题（带 .md 后缀），改回干净的展示标题
   await client.request('POST', `/wiki/v2/spaces/${spaceId}/nodes/${nodeToken}/update_title`, {
     json: { title },
   });
   return nodeToken;
+}
+
+// 轮询 move 异步任务直到完成，返回新节点的 node_token
+// 响应结构：data.task.move_result[0].node.node_token（任务完成前 move_result 为空）
+async function pollMoveTask(client, taskId) {
+  for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
+    await sleep(POLL_INTERVAL_MS);
+    const data = await client.request('GET', `/wiki/v2/tasks/${taskId}`, {
+      query: { task_type: 'move' },
+    });
+    const nodeToken = data.task?.move_result?.[0]?.node?.node_token;
+    if (nodeToken) return nodeToken;
+  }
+  throw new Error(`move 异步任务轮询超时（task_id=${taskId}，${POLL_MAX_ATTEMPTS * POLL_INTERVAL_MS / 1000}s）`);
 }
 
 // 把文件移入回收站（docx 文档、上传的源文件均适用，知识库内文档删除后节点随之消失）
