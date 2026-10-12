@@ -232,6 +232,41 @@ async function uploadForImport(client, fileName, buf) {
   return data.file_token;
 }
 
+// 常驻"图床"空文档（素材挂载点，创建一次后缓存在 map 中复用，勿删）
+async function ensureImageHostDoc(client, map) {
+  if (map.imageHostDoc) return map.imageHostDoc;
+  const rootFolderToken = await client.getRootFolderToken();
+  const data = await client.request('POST', '/docx/v1/documents', {
+    json: { folder_token: rootFolderToken, title: '知识库同步-图床(勿删)' },
+  });
+  map.imageHostDoc = data.document?.document_id;
+  if (!map.imageHostDoc) throw new Error('创建图床文档失败');
+  return map.imageHostDoc;
+}
+
+// 上传图片为 docx_image 素材（挂在图床文档下），返回 file_token
+// 注：medias 体系的临时链接接口只认素材 token，不认 files/upload_all 上传的云空间文件
+async function uploadImage(client, map, fileName, buf) {
+  const form = new FormData();
+  form.append('file_name', fileName);
+  form.append('parent_type', 'docx_image');
+  form.append('parent_node', await ensureImageHostDoc(client, map));
+  form.append('size', String(buf.length));
+  form.append('file', new Blob([buf]), fileName);
+  const data = await client.request('POST', '/drive/v1/medias/upload_all', { formData: form });
+  return data.file_token;
+}
+
+// 获取素材临时下载链接（有效期有限，每次同步需重新获取；导入任务即时拉取足够）
+async function getImageTempUrl(client, fileToken) {
+  const data = await client.request('GET', '/drive/v1/medias/batch_get_tmp_download_url', {
+    query: { file_tokens: fileToken },
+  });
+  const entry = data.tmp_download_urls?.find((item) => item.file_token === fileToken);
+  if (!entry?.tmp_download_url) throw new Error('未返回临时下载链接');
+  return entry.tmp_download_url;
+}
+
 // 创建 md→docx 服务端转换任务并轮询到终态，返回 docx 的 document_id
 // 注：file_name 必须传与上传时一致的完整文件名（含 .md 扩展名），
 //     否则服务端不做内容转换，会生成无内容的空文档
@@ -330,13 +365,44 @@ async function ensureDirNode(client, spaceId, map, relDir) {
 }
 
 // 同步单个 md：导入新文档 → 挂节点 → 清理源文件与旧文档，返回结果分类
-async function syncFile(client, spaceId, map, relFile, buf) {
+async function syncFile(client, spaceId, map, relFile, rawBuf) {
   const fileName = path.basename(relFile);
   const title = fileName.replace(/\.md$/i, '');
   const parentRel = relFile.includes('/') ? relFile.slice(0, relFile.lastIndexOf('/')) : '';
   const parentNodeToken = parentRel
     ? await ensureDirNode(client, spaceId, map, parentRel)
     : undefined;
+
+  // 处理文档内的本地图片引用（![](images/xxx.png)）：飞书服务端 md→docx 转换
+  // 只能拉取可访问的 http(s) 链接，因此先把图片上传为云空间素材，
+  // 再把引用替换为素材的临时下载链接；file_token 缓存进 map 避免重复上传
+  map.images ??= {};
+  let buf = rawBuf;
+  const content = rawBuf.toString('utf8');
+  const imgRefs = [...content.matchAll(/!\[[^\]]*\]\((images\/[^)\s]+)\)/g)];
+  if (imgRefs.length > 0) {
+    const replaced = new Map(); // 相对路径 -> 临时链接
+    for (const match of imgRefs) {
+      const relImg = match[1];
+      if (replaced.has(relImg)) continue;
+      const cacheKey = `${relFile}::${relImg}`;
+      try {
+        let fileToken = map.images[cacheKey]?.file_token;
+        if (!fileToken) {
+          const imgBuf = await readFile(path.join(ROOT, path.dirname(relFile), relImg));
+          fileToken = await uploadImage(client, map, path.basename(relImg), imgBuf);
+          map.images[cacheKey] = { file_token: fileToken };
+          console.log(`  · 上传图片素材 ${relImg}`);
+        }
+        replaced.set(relImg, await getImageTempUrl(client, fileToken));
+      } catch (error) {
+        throw new Error(`图片处理失败 ${relImg}：${error.message}`);
+      }
+    }
+    for (const [relImg, url] of replaced) {
+      buf = Buffer.from(buf.toString('utf8').replaceAll(`](${relImg})`, `](${url})`), 'utf8');
+    }
+  }
 
   const fileToken = await uploadForImport(client, fileName, buf);
   const documentId = await importAsDocx(client, fileToken, fileName);
@@ -358,7 +424,7 @@ async function syncFile(client, spaceId, map, relFile, buf) {
     kind: 'doc',
     node_token: nodeToken,
     obj_token: documentId,
-    hash: sha256Hex(buf),
+    hash: sha256Hex(rawBuf), // hash 按本地原文件算（替换临时链接后的内容每次同步都不同）
   };
   if (old?.obj_token && old.obj_token !== documentId) {
     try {
