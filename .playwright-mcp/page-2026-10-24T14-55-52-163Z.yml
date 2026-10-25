@@ -1,0 +1,279 @@
+- generic [ref=f11e1]:
+  - link "欢迎进入 真题卷（含答案） | 2022年10月00023高等数学（工本） - 知乎,盲人用户使用操作智能引导，请按快捷键Ctrl+Alt+R；阅读详细操作说明请按快捷键Ctrl+Alt+问号键。":
+    - /url: javascript:void(0)
+    - img [ref=f11e2] [cursor=pointer]
+  - generic [ref=f11e4]:
+    - banner [ref=f11e6]:
+      - generic [ref=f11e7]:
+        - link "知乎" [ref=f11e8] [cursor=pointer]:
+          - /url: https://www.zhihu.com
+        - generic [ref=f11e13]:
+          - generic [ref=f11e14]:
+            - navigation [ref=f11e15]:
+              - link "关注" [ref=f11e16] [cursor=pointer]:
+                - /url: https://www.zhihu.com/signin?next=%2Ffollow
+              - link "推荐" [ref=f11e18] [cursor=pointer]:
+                - /url: https://www.zhihu.com/signin?next=%2F
+              - link "热榜" [ref=f11e20] [cursor=pointer]:
+                - /url: https://www.zhihu.com/signin?next=%2Fhot
+              - link "专栏" [ref=f11e22] [cursor=pointer]:
+                - /url: https://www.zhihu.com/signin?next=%2Fcolumn-square
+              - link "圈子" [ref=f11e24] [cursor=pointer]:
+                - /url: https://www.zhihu.com/signin?next=%2Fring-feeds
+              - link "AI Works Beta" [ref=f11e27] [cursor=pointer]:
+                - /url: https://www.zhihu.com/project-square
+                - generic [ref=f11e28]:
+                  - text: AI Works
+                  - generic: Beta
+              - link "故事" [ref=f11e30] [cursor=pointer]:
+                - /url: https://www.zhihu.com/fiore/h5/vip-web
+            - generic [ref=f11e32]:
+              - search [ref=f11e33]:
+                - generic [ref=f11e37]:
+                  - combobox "搜索" [ref=f11e38]
+                  - button "搜索" [ref=f11e39] [cursor=pointer]
+                - link "直答" [ref=f11e43] [cursor=pointer]:
+                  - /url: https://zhida.zhihu.com/
+              - generic [ref=f11e47]:
+                - generic [ref=f11e48]: 切换模式
+                - button "登录/注册" [ref=f11e51] [cursor=pointer]
+          - generic:
+            - generic:
+              - generic:
+                - generic:
+                  - generic:
+                    - generic:
+                      - generic:
+                        - generic: 真题卷（含答案） | 2022年10月00023高等数学（工本）
+                        - generic:
+                          - generic:
+                            - generic: 切换模式
+                            - generic:
+                              - button
+    - main [ref=f11e53]:
+      - generic [ref=f11e54]:
+        - generic [ref=f11e55]:
+          - generic [ref=f11e57]:
+            - img "真题卷（含答案） | 2022年10月00023高等数学（工本）" [ref=f11e61]
+            - article [ref=f11e62]:
+              - generic [ref=f11e63]:
+                - heading "真题卷（含答案） | 2022年10月00023高等数学（工本）" [level=1] [ref=f11e64]
+                - generic [ref=f11e67]:
+                  - link [ref=f11e70] [cursor=pointer]:
+                    - /url: //www.zhihu.com/people/ku-xie-zai-ye-mei-you
+                    - img "自考进行时" [ref=f11e71]
+                  - generic [ref=f11e72]:
+                    - link "自考进行时" [ref=f11e76] [cursor=pointer]:
+                      - /url: //www.zhihu.com/people/ku-xie-zai-ye-mei-you
+                    - generic [ref=f11e77]: 找我（sczk2023）
+                - generic [ref=f11e80]: 4 人赞同了该文章
+              - generic [ref=f11e89]:
+                - figure [ref=f11e90]
+                - figure [ref=f11e93]
+                - figure [ref=f11e96]
+                - figure [ref=f11e99]
+                - figure [ref=f11e102]
+                - figure [ref=f11e105]
+                - figure [ref=f11e108]
+                - paragraph [ref=f11e111]
+                - paragraph [ref=f11e112]: 联系曾老师：获取更多自考真题
+                - link [ref=f11e114] [cursor=pointer]:
+                  - /url: https://link.zhihu.com/?target=https%3A//mp.weixin.qq.com/s/3ZTvJmYTrZsXt_qdODm3JQ
+                - paragraph
+              - button "发布于 2023-03-01 11:31・四川" [ref=f11e119]
+              - generic [ref=f11e121]:
+                - link "数学" [ref=f11e124] [cursor=pointer]:
+                  - /url: //www.zhihu.com/topic/19554091
+                - link "高等数学" [ref=f11e128] [cursor=pointer]:
+                  - /url: //www.zhihu.com/topic/19612131
+                - link "自考真题" [ref=f11e132] [cursor=pointer]:
+                  - /url: //www.zhihu.com/topic/26418882
+              - generic [ref=f11e137]:
+                - generic [ref=f11e138]:
+                  - button "赞同 4" [ref=f11e140] [cursor=pointer]
+                  - button "反对" [ref=f11e144] [cursor=pointer]
+                - button [ref=f11e148] [cursor=pointer]
+                - button "收藏" [ref=f11e152] [cursor=pointer]: "2"
+                - button "喜欢" [ref=f11e156] [cursor=pointer]
+                - button [ref=f11e162] [cursor=pointer]
+                - button [ref=f11e166] [cursor=pointer]
+                - button [ref=f11e172] [cursor=pointer]
+                - button [ref=f11e180] [cursor=pointer]
+            - generic [ref=f11e186]:
+              - generic [ref=f11e187]: 未登录用户
+              - generic [ref=f11e201]: 还没有评论，发表第一个评论吧
+          - generic [ref=f11e294]:
+            - generic "边栏锚点"
+            - generic [ref=f11e295]:
+              - complementary "关于作者" [ref=f11e296]:
+                - generic [ref=f11e300]:
+                  - link [ref=f11e303] [cursor=pointer]:
+                    - /url: //www.zhihu.com/people/ku-xie-zai-ye-mei-you
+                    - img "自考进行时" [ref=f11e304]
+                  - generic [ref=f11e305]:
+                    - link "自考进行时" [ref=f11e308] [cursor=pointer]:
+                      - /url: //www.zhihu.com/people/ku-xie-zai-ye-mei-you
+                    - generic [ref=f11e309]: 找我（sczk2023）
+                - generic [ref=f11e311]:
+                  - generic [ref=f11e313]:
+                    - link "回答 241" [ref=f11e314] [cursor=pointer]:
+                      - /url: //www.zhihu.com/people/ku-xie-zai-ye-mei-you/answers
+                      - generic [ref=f11e315]:
+                        - generic [ref=f11e316]: 回答
+                        - strong [ref=f11e317]: "241"
+                    - link "文章 1,080" [ref=f11e318] [cursor=pointer]:
+                      - /url: //www.zhihu.com/people/ku-xie-zai-ye-mei-you/posts
+                      - generic [ref=f11e319]:
+                        - generic [ref=f11e320]: 文章
+                        - strong [ref=f11e321]: 1,080
+                    - link "关注者 356" [ref=f11e322] [cursor=pointer]:
+                      - /url: //www.zhihu.com/people/ku-xie-zai-ye-mei-you/followers
+                      - generic [ref=f11e323]:
+                        - generic [ref=f11e324]: 关注者
+                        - strong [ref=f11e325]: "356"
+                  - generic [ref=f11e326]:
+                    - button [ref=f11e327] [cursor=pointer]
+                    - button [ref=f11e331] [cursor=pointer]
+              - generic [ref=f11e336]:
+                - generic [ref=f11e337]:
+                  - generic [ref=f11e340]: 大家都在搜
+                  - button "换一换" [ref=f11e341] [cursor=pointer]
+                - generic [ref=f11e344]:
+                  - generic [ref=f11e345] [cursor=pointer]:
+                    - link "中土网民爆发大规模互怼 451 万" [ref=f11e347]:
+                      - /url: https://www.zhihu.com/search?q=%E4%B8%AD%E5%9C%9F%E7%BD%91%E6%B0%91%E7%88%86%E5%8F%91%E5%A4%A7%E8%A7%84%E6%A8%A1%E4%BA%92%E6%80%BC&search_source=Trending&utm_content=search_hot&utm_medium=organic&utm_source=zhihu&type=content&request_click_id=2ffa7ac0-11a3-4a18-b44c-42803c1d6e15
+                      - generic "中土网民爆发大规模互怼" [ref=f11e348]
+                      - generic [ref=f11e349]: 451 万
+                    - generic [ref=f11e350]: 热
+                  - generic [ref=f11e351] [cursor=pointer]:
+                    - link "LPL瑞士轮首轮全败 373 万" [ref=f11e353]:
+                      - /url: https://www.zhihu.com/search?q=LPL%E7%91%9E%E5%A3%AB%E8%BD%AE%E9%A6%96%E8%BD%AE%E5%85%A8%E8%B4%A5&search_source=Trending&utm_content=search_hot&utm_medium=organic&utm_source=zhihu&type=content&request_click_id=2ffa7ac0-11a3-4a18-b44c-42803c1d6e15
+                      - generic "LPL瑞士轮首轮全败" [ref=f11e354]
+                      - generic [ref=f11e355]: 373 万
+                    - generic [ref=f11e356]: 热
+                  - generic [ref=f11e357] [cursor=pointer]:
+                    - link "青海玉树州杂多县发生 5.3 级地震 370 万" [ref=f11e359]:
+                      - /url: https://www.zhihu.com/search?q=%E9%9D%92%E6%B5%B7%E7%8E%89%E6%A0%91%E5%B7%9E%E6%9D%82%E5%A4%9A%E5%8E%BF%E5%8F%91%E7%94%9F+5.3+%E7%BA%A7%E5%9C%B0%E9%9C%87&search_source=Trending&utm_content=search_hot&utm_medium=organic&utm_source=zhihu&type=content&request_click_id=2ffa7ac0-11a3-4a18-b44c-42803c1d6e15
+                      - generic "青海玉树州杂多县发生 5.3 级地震" [ref=f11e360]
+                      - generic [ref=f11e361]: 370 万
+                    - generic [ref=f11e362]: 新
+                  - generic [ref=f11e363] [cursor=pointer]:
+                    - link "毛不易婚礼致辞争议 366 万" [ref=f11e365]:
+                      - /url: https://www.zhihu.com/search?q=%E6%AF%9B%E4%B8%8D%E6%98%93%E5%A9%9A%E7%A4%BC%E8%87%B4%E8%BE%9E%E4%BA%89%E8%AE%AE&search_source=Trending&utm_content=search_hot&utm_medium=organic&utm_source=zhihu&type=content&request_click_id=2ffa7ac0-11a3-4a18-b44c-42803c1d6e15
+                      - generic "毛不易婚礼致辞争议" [ref=f11e366]
+                      - generic [ref=f11e367]: 366 万
+                    - generic [ref=f11e368]: 热
+                  - generic [ref=f11e369] [cursor=pointer]:
+                    - link "「死了么」App公布收费标准 333 万" [ref=f11e371]:
+                      - /url: https://www.zhihu.com/search?q=%E3%80%8C%E6%AD%BB%E4%BA%86%E4%B9%88%E3%80%8DApp%E5%85%AC%E5%B8%83%E6%94%B6%E8%B4%B9%E6%A0%87%E5%87%86&search_source=Trending&utm_content=search_hot&utm_medium=organic&utm_source=zhihu&type=content&request_click_id=2ffa7ac0-11a3-4a18-b44c-42803c1d6e15
+                      - generic "「死了么」App公布收费标准" [ref=f11e372]
+                      - generic [ref=f11e373]: 333 万
+                    - generic [ref=f11e374]: 热
+                  - generic [ref=f11e375] [cursor=pointer]:
+                    - link "Kimi K3.1 Pro 正式发布 315 万" [ref=f11e377]:
+                      - /url: https://www.zhihu.com/search?q=Kimi+K3.1+Pro+%E6%AD%A3%E5%BC%8F%E5%8F%91%E5%B8%83&search_source=Trending&utm_content=search_hot&utm_medium=organic&utm_source=zhihu&type=content&request_click_id=2ffa7ac0-11a3-4a18-b44c-42803c1d6e15
+                      - generic "Kimi K3.1 Pro 正式发布" [ref=f11e378]
+                      - generic [ref=f11e379]: 315 万
+                    - generic [ref=f11e380]: 热
+                  - link "iPhoneDuo屏幕开裂 292 万" [ref=f11e383] [cursor=pointer]:
+                    - /url: https://www.zhihu.com/search?q=iPhoneDuo%E5%B1%8F%E5%B9%95%E5%BC%80%E8%A3%82&search_source=Trending&utm_content=search_hot&utm_medium=organic&utm_source=zhihu&type=content&request_click_id=2ffa7ac0-11a3-4a18-b44c-42803c1d6e15
+                    - generic "iPhoneDuo屏幕开裂" [ref=f11e384]
+                    - generic [ref=f11e385]: 292 万
+                  - link "子祺事变 290 万" [ref=f11e388] [cursor=pointer]:
+                    - /url: https://www.zhihu.com/search?q=%E5%AD%90%E7%A5%BA%E4%BA%8B%E5%8F%98&search_source=Trending&utm_content=search_hot&utm_medium=organic&utm_source=zhihu&type=content&request_click_id=2ffa7ac0-11a3-4a18-b44c-42803c1d6e15
+                    - generic "子祺事变" [ref=f11e389]
+                    - generic [ref=f11e390]: 290 万
+                  - link "三部门调查尊界刹车踏板支架断裂问题 270 万" [ref=f11e393] [cursor=pointer]:
+                    - /url: https://www.zhihu.com/search?q=%E4%B8%89%E9%83%A8%E9%97%A8%E8%B0%83%E6%9F%A5%E5%B0%8A%E7%95%8C%E5%88%B9%E8%BD%A6%E8%B8%8F%E6%9D%BF%E6%94%AF%E6%9E%B6%E6%96%AD%E8%A3%82%E9%97%AE%E9%A2%98&search_source=Trending&utm_content=search_hot&utm_medium=organic&utm_source=zhihu&type=content&request_click_id=2ffa7ac0-11a3-4a18-b44c-42803c1d6e15
+                    - generic "三部门调查尊界刹车踏板支架断裂问题" [ref=f11e394]
+                    - generic [ref=f11e395]: 270 万
+                  - generic [ref=f11e396] [cursor=pointer]:
+                    - link "秦始皇兵马俑上发现女性指纹 261 万" [ref=f11e398]:
+                      - /url: https://www.zhihu.com/search?q=%E7%A7%A6%E5%A7%8B%E7%9A%87%E5%85%B5%E9%A9%AC%E4%BF%91%E4%B8%8A%E5%8F%91%E7%8E%B0%E5%A5%B3%E6%80%A7%E6%8C%87%E7%BA%B9&search_source=Trending&utm_content=search_hot&utm_medium=organic&utm_source=zhihu&type=content&request_click_id=2ffa7ac0-11a3-4a18-b44c-42803c1d6e15
+                      - generic "秦始皇兵马俑上发现女性指纹" [ref=f11e399]
+                      - generic [ref=f11e400]: 261 万
+                    - generic [ref=f11e401]: 热
+        - complementary "推荐阅读" [ref=f11e403]:
+          - heading "推荐阅读" [level=3] [ref=f11e404]
+          - list [ref=f11e405]:
+            - link "自考00020高等数学（一）的看法及建议 高数一在自考课程中可以称得上有难度的课，有多少同学都败于它的威力下，考了数次都没有能通过，变成保留科目，严重影响毕业时间，甚者因它而放弃所有过往努力，不考了。鉴于上面原因，结合… 无恙" [ref=f11e406] [cursor=pointer]:
+              - /url: https://zhuanlan.zhihu.com/p/313076058
+              - generic [ref=f11e407]:
+                - heading "自考00020高等数学（一）的看法及建议" [level=1] [ref=f11e408]
+                - paragraph [ref=f11e409]: 高数一在自考课程中可以称得上有难度的课，有多少同学都败于它的威力下，考了数次都没有能通过，变成保留科目，严重影响毕业时间，甚者因它而放弃所有过往努力，不考了。鉴于上面原因，结合…
+                - generic [ref=f11e410]: 无恙
+            - link "自考高数真的难吗？怎么学才好？ 说起自考高数，很多考生内心都是很抗拒的。如果是一个数学基础比较差或者文科生来考，高数对他们来说确实是一道门槛，那么要怎么学习才可以顺利通过考试呢？如果你报考的专业课程包括了高数… 潜香" [ref=f11e412] [cursor=pointer]:
+              - /url: https://zhuanlan.zhihu.com/p/402364747
+              - generic [ref=f11e413]:
+                - heading "自考高数真的难吗？怎么学才好？" [level=1] [ref=f11e414]
+                - paragraph [ref=f11e415]: 说起自考高数，很多考生内心都是很抗拒的。如果是一个数学基础比较差或者文科生来考，高数对他们来说确实是一道门槛，那么要怎么学习才可以顺利通过考试呢？如果你报考的专业课程包括了高数…
+                - generic [ref=f11e416]: 潜香
+            - link "自考线性代数04184 和概率论04183备考攻略 自考线性代数04184 和概率论04183备考攻略 黎明欲晓" [ref=f11e418] [cursor=pointer]:
+              - /url: https://zhuanlan.zhihu.com/p/431838693
+              - generic [ref=f11e419]:
+                - img "自考线性代数04184 和概率论04183备考攻略" [ref=f11e420]
+                - heading "自考线性代数04184 和概率论04183备考攻略" [level=1] [ref=f11e421]
+                - generic [ref=f11e422]: 黎明欲晓
+            - link "从缺考到自考高等数学87分，我是这么学的！ 从缺考到自考高等数学87分，我是这么学的！ 陈林 发表于自考树课堂" [ref=f11e424] [cursor=pointer]:
+              - /url: https://zhuanlan.zhihu.com/p/37004107
+              - generic [ref=f11e425]:
+                - img "从缺考到自考高等数学87分，我是这么学的！" [ref=f11e426]
+                - heading "从缺考到自考高等数学87分，我是这么学的！" [level=1] [ref=f11e427]
+                - generic [ref=f11e428]:
+                  - generic [ref=f11e429]: 陈林
+                  - generic [ref=f11e430]: 发表于自考树课堂
+            - button [ref=f11e431] [cursor=pointer]
+    - complementary:
+      - generic [ref=f11e434]:
+        - button "回到顶部" [ref=f11e435] [cursor=pointer]
+        - button "看山" [ref=f11e439] [cursor=pointer]
+  - generic [active] [ref=f11e446]:
+    - generic [ref=f11e450]:
+      - generic [ref=f11e451]:
+        - generic [ref=f11e452]:
+          - generic [ref=f11e453]:
+            - generic [ref=f11e454]: 打开知乎App
+            - generic [ref=f11e455]: 在「我的页」右上角打开扫一扫
+            - generic [ref=f11e456]: 其他扫码方式：微信
+          - generic [ref=f11e461]:
+            - button "下载知乎App" [ref=f11e463] [cursor=pointer]
+            - button "无障碍模式" [ref=f11e465] [cursor=pointer]
+        - generic [ref=f11e467]:
+          - generic [ref=f11e469]:
+            - generic [ref=f11e470]:
+              - generic [ref=f11e471]:
+                - button "验证码登录" [ref=f11e472] [cursor=pointer]
+                - button "密码登录" [ref=f11e473] [cursor=pointer]
+                - link "开通机构号" [ref=f11e474] [cursor=pointer]:
+                  - /url: /org/signup
+              - generic [ref=f11e475]:
+                - combobox [ref=f11e478] [cursor=pointer]:
+                  - generic [ref=f11e479]: 中国 +86
+                - textbox [ref=f11e485]:
+                  - /placeholder: 手机号
+              - generic [ref=f11e486]:
+                - textbox [ref=f11e489]:
+                  - /placeholder: 输入 6 位短信验证码
+                - button "获取短信验证码" [ref=f11e490] [cursor=pointer]
+              - generic [ref=f11e491]:
+                - button
+                - button "忘记密码" [ref=f11e492] [cursor=pointer]
+              - button "登录/注册" [ref=f11e494] [cursor=pointer]
+            - generic:
+              - log
+          - generic [ref=f11e495]: 其他方式登录
+          - generic [ref=f11e500]:
+            - button [ref=f11e501] [cursor=pointer]
+            - button [ref=f11e504] [cursor=pointer]
+            - button [ref=f11e507] [cursor=pointer]
+          - generic [ref=f11e510]:
+            - text: 未注册手机验证后自动登录，注册即代表同意
+            - link "《知乎协议》" [ref=f11e511] [cursor=pointer]:
+              - /url: https://www.zhihu.com/term/zhihu-terms
+            - link "《隐私保护指引》" [ref=f11e512] [cursor=pointer]:
+              - /url: https://www.zhihu.com/term/privacy
+      - generic:
+        - paragraph: 扫码下载知乎 App
+        - button "关闭二维码"
+    - button "关闭" [ref=f11e513] [cursor=pointer]
+  - combobox [ref=f11e520] [cursor=pointer]
