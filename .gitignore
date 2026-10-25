@@ -6,3 +6,4 @@ node_modules/
 # 飞书同步状态（本机运行时产物，含个人知识库节点映射）
 .feishu-sync-map.json
 __pycache__/
+.playwright-mcp/
